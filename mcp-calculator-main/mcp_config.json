@@ -6,7 +6,9 @@
       "args": [
         "--with",
         "duckduckgo-mcp-server[browser]",
-        "duckduckgo-mcp-server"
+        "duckduckgo-mcp-server",
+        "--fetch-backend",
+        "auto"
       ],
       "env": {
         "DDG_SAFE_SEARCH": "STRICT",
