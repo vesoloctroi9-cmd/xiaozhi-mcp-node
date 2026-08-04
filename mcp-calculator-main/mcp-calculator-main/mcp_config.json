@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "duckduckgo-web-search": {
+      "type": "stdio",
+      "command": "python",
+      "args": [
+        "atlas_cache_mcp_proxy.py"
+      ],
+      "env": {
+        "DDG_SAFE_SEARCH": "STRICT",
+        "DDG_REGION": "wt-wt",
+        "DDG_SEARCH_BACKEND": "auto"
+      }
+    }
+  }
+}
