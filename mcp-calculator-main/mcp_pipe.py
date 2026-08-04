@@ -39,6 +39,7 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger('MCP_PIPE')
+logger.setLevel(logging.DEBUG)
 
 # Reconnection settings
 INITIAL_BACKOFF = 1  # Initial wait time in seconds
