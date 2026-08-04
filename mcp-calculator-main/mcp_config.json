@@ -2,13 +2,9 @@
   "mcpServers": {
     "duckduckgo-web-search": {
       "type": "stdio",
-      "command": "uvx",
+      "command": "python",
       "args": [
-        "--with",
-        "duckduckgo-mcp-server[browser]",
-        "duckduckgo-mcp-server",
-        "--fetch-backend",
-        "auto"
+        "atlas_cache_mcp_proxy.py"
       ],
       "env": {
         "DDG_SAFE_SEARCH": "STRICT",
