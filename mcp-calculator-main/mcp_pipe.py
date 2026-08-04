@@ -67,12 +67,12 @@ async def connect_to_server(uri, target):
     """Connect to WebSocket server and pipe stdio for the given server target."""
     try:
         logger.info(f"[{target}] Connecting to WebSocket server...")
-        async with wasync with websockets.connect(
-    uri,
-    ping_interval=20,
-    ping_timeout=60,
-    close_timeout=10
-) as websocket:ebsockets.connect(uri, ping_interval=None) as websocket:
+        async with websockets.connect(
+            uri,
+            ping_interval=20,
+            ping_timeout=60,
+            close_timeout=10
+        ) as websocket:
             logger.info(f"[{target}] Successfully connected to WebSocket server")
 
             # Start server process (built from CLI arg or config)
@@ -87,7 +87,7 @@ async def connect_to_server(uri, target):
                 env=env
             )
             logger.info(f"[{target}] Started server process: {' '.join(cmd)}")
-            
+
             # Create two tasks: read from WebSocket and write to process, read from process and write to WebSocket
             await asyncio.gather(
                 pipe_websocket_to_process(websocket, process, target),
@@ -118,7 +118,7 @@ async def pipe_websocket_to_process(websocket, process, target):
             # Read message from WebSocket
             message = await websocket.recv()
             logger.debug(f"[{target}] << {message[:120]}...")
-            
+
             # Write to process stdin (in text mode)
             if isinstance(message, bytes):
                 message = message.decode('utf-8')
@@ -138,11 +138,11 @@ async def pipe_process_to_websocket(process, websocket, target):
         while True:
             # Read data from process stdout
             data = await asyncio.to_thread(process.stdout.readline)
-            
+
             if not data:  # If no data, the process may have ended
                 logger.info(f"[{target}] Process has ended output")
                 break
-                
+
             # Send data to WebSocket
             logger.debug(f"[{target}] >> {data[:120]}...")
             # In text mode, data is already a string, no need to decode
@@ -157,11 +157,11 @@ async def pipe_process_stderr_to_terminal(process, target):
         while True:
             # Read data from process stderr
             data = await asyncio.to_thread(process.stderr.readline)
-            
+
             if not data:  # If no data, the process may have ended
                 logger.info(f"[{target}] Process has ended stderr output")
                 break
-                
+
             # Print stderr data to terminal (in text mode, data is already a string)
             sys.stderr.write(data)
             sys.stderr.flush()
@@ -247,13 +247,13 @@ def build_server_command(target=None):
 if __name__ == "__main__":
     # Register signal handler
     signal.signal(signal.SIGINT, signal_handler)
-    
+
     # Get token from environment variable or command line arguments
     endpoint_url = os.environ.get('MCP_ENDPOINT')
     if not endpoint_url:
         logger.error("Please set the `MCP_ENDPOINT` environment variable")
         sys.exit(1)
-    
+
     # Determine target: default to all if no arg; single target otherwise
     target_arg = sys.argv[1] if len(sys.argv) >= 2 else None
 
