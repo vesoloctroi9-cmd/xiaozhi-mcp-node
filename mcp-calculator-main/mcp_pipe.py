@@ -42,7 +42,7 @@ logger = logging.getLogger('MCP_PIPE')
 
 # Reconnection settings
 INITIAL_BACKOFF = 1  # Initial wait time in seconds
-MAX_BACKOFF = 600  # Maximum wait time in seconds
+MAX_BACKOFF = 30  # Maximum wait time in seconds
 
 async def connect_with_retry(uri, target):
     """Connect to WebSocket server with retry mechanism for a given server target."""
@@ -67,7 +67,12 @@ async def connect_to_server(uri, target):
     """Connect to WebSocket server and pipe stdio for the given server target."""
     try:
         logger.info(f"[{target}] Connecting to WebSocket server...")
-        async with websockets.connect(uri, ping_interval=None) as websocket:
+        async with wasync with websockets.connect(
+    uri,
+    ping_interval=20,
+    ping_timeout=60,
+    close_timeout=10
+) as websocket:ebsockets.connect(uri, ping_interval=None) as websocket:
             logger.info(f"[{target}] Successfully connected to WebSocket server")
 
             # Start server process (built from CLI arg or config)
