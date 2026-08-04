@@ -1,6 +1,6 @@
 """
-ATLAS MCP PIPE + RESEARCH SCANNER
-Version: 1.0.0
+ATLAS MCP PIPE + RESEARCH SCANNER + RENDER KEEP-ALIVE SERVER
+Version: 1.1.0
 
 Purpose
 -------
@@ -8,26 +8,7 @@ Purpose
 2) Auto-reconnect the Xiaozhi WebSocket.
 3) Auto-restart the MCP child process after disconnect/crash.
 4) Run a real research scanner on a schedule.
-5) The scanner uses a SEPARATE MCP stdio client process, so it never competes
-   with Xiaozhi for the same stdin/stdout stream.
-6) Save scanner results to a JSON cache.
-
-Required environment
---------------------
-MCP_ENDPOINT=<xiaozhi websocket endpoint>
-
-Optional environment
---------------------
-MCP_CONFIG=/path/to/mcp_config.json
-MCP_LOG_LEVEL=INFO
-
-ATLAS_RESEARCH_TOPICS=trí tuệ nhân tạo mới nhất,công nghệ mới nhất,tin Việt Nam mới nhất
-ATLAS_RESEARCH_INTERVAL_SECONDS=600
-ATLAS_RESEARCH_RESULTS_PER_TOPIC=3
-ATLAS_RESEARCH_FETCH_TOP=1
-ATLAS_RESEARCH_OUTPUT=/tmp/atlas_research.json
-ATLAS_RESEARCH_SERVER=duckduckgo-web-search
-ATLAS_RESEARCH_MAX_ITEMS=100
+5) Expose an HTTP Health Check endpoint to pass Render's sleep/idle mechanism.
 """
 
 from __future__ import annotations
@@ -47,6 +28,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import websockets
+from aiohttp import web
 from dotenv import load_dotenv
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
@@ -84,6 +66,38 @@ DEFAULT_RESEARCH_OUTPUT = "/tmp/atlas_research.json"
 
 URL_RE = re.compile(r"https?://[^\s<>\]\[()\"']+", re.IGNORECASE)
 
+
+# ============================================================================
+# RENDER HEALTH CHECK / KEEP-ALIVE HTTP SERVER
+# ============================================================================
+
+async def handle_health_check(request: web.Request) -> web.Response:
+    """Endpoint phản hồi HTTP Status 200 cho Render / UptimeRobot ping."""
+    return web.Response(
+        text="OK - ATLAS MCP Pipe & Research Scanner is active", 
+        status=200
+    )
+
+
+async def start_health_check_server() -> web.AppRunner:
+    """Tạo HTTP Server trên port được Render cấp (mặc định 10000)."""
+    app = web.Application()
+    app.router.add_get("/", handle_health_check)
+    app.router.add_get("/health", handle_health_check)
+
+    port = int(os.environ.get("PORT", 10000))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    
+    logger.info("[HTTP] Starting Health Check Server on port %s...", port)
+    await site.start()
+    return runner
+
+
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -205,6 +219,10 @@ def build_server_command(target: str) -> Tuple[List[str], Dict[str, str]]:
         f"'{target}' is neither a configured MCP server nor an existing script"
     )
 
+
+# ============================================================================
+# WEBSOCKET & MCP PROCESS BRIDGE
+# ============================================================================
 
 async def pipe_websocket_to_process(
     websocket: Any,
@@ -423,6 +441,10 @@ async def connect_with_retry(uri: str, target: str) -> None:
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, MAX_BACKOFF)
 
+
+# ============================================================================
+# RESEARCH SCANNER & CACHE
+# ============================================================================
 
 @dataclass
 class ResearchItem:
@@ -883,11 +905,18 @@ def signal_handler(sig: int, frame: Any) -> None:
     raise KeyboardInterrupt
 
 
+# ============================================================================
+# MAIN APPLICATION ENTRY POINT
+# ============================================================================
+
 async def main() -> None:
     endpoint_url = os.environ.get("MCP_ENDPOINT", "").strip()
 
     if not endpoint_url:
         raise RuntimeError("MCP_ENDPOINT is missing")
+
+    # 1. Khởi chạy HTTP Server Keep-Alive
+    http_runner = await start_health_check_server()
 
     target_arg = sys.argv[1] if len(sys.argv) >= 2 else None
 
@@ -942,6 +971,7 @@ async def main() -> None:
         await asyncio.gather(*mcp_tasks, scanner_task)
 
     finally:
+        logger.info("Cleaning up tasks and HTTP server...")
         for task in [*mcp_tasks, scanner_task]:
             if not task.done():
                 task.cancel()
@@ -951,6 +981,9 @@ async def main() -> None:
             scanner_task,
             return_exceptions=True,
         )
+        
+        # Dọn dẹp HTTP Server
+        await http_runner.cleanup()
 
 
 if __name__ == "__main__":
