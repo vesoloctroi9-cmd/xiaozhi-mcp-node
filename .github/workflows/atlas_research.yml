@@ -23,7 +23,7 @@ env:
   ATLAS_RESEARCH_FETCH_TOP: "1"
   ATLAS_RESEARCH_MAX_ITEMS: "100"
   ATLAS_RESEARCH_OUTPUT: "site/atlas_research.json"
-  ATLAS_MCP_CONFIG: "mcp-calculator-main/mcp_config.json"
+  ATLAS_MCP_CONFIG: "mcp-calculator-main/mcp_research_config.json"
   ATLAS_TOOL_TIMEOUT_SECONDS: "45"
   ATLAS_REMOTE_CACHE_TIMEOUT_SECONDS: "12"
   ATLAS_FETCH_MAX_LENGTH: "8000"
@@ -48,10 +48,10 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -r mcp-calculator-main/requirements.txt uv
+          python -m pip install -r mcp-calculator-main/requirements.txt
 
       - name: Static Python syntax audit
-        run: python -m py_compile research_worker.py
+        run: python -m py_compile research_worker.py mcp-calculator-main/atlas_cache_mcp_proxy.py mcp-calculator-main/mcp_pipe.py
 
       - name: Run ATLAS Research Worker
         run: python research_worker.py
