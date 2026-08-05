@@ -1,6 +1,6 @@
 """
 ATLAS NODE-2 MCP BRIDGE
-Version: 2.2.0 TEST
+Version: 2.3.0 DIAGNOSTICS
 
 Mục tiêu
 --------
@@ -62,7 +62,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-VERSION = "2.2.0-test"
+VERSION = "2.3.0"
 SERVICE_NAME = "ATLAS NODE-2 MCP"
 LOG_LEVEL = os.environ.get("MCP_LOG_LEVEL", "INFO").upper()
 
@@ -188,6 +188,9 @@ class ServerState:
     last_tool_result_at: str = ""
     last_tool_result_ok: Optional[bool] = None
     last_tool_error: str = ""
+    last_tool_content_chars: int = 0
+    last_tool_content_empty: Optional[bool] = None
+    last_tool_content_preview: str = ""
 
     last_mcp_stderr: str = ""
     last_external_http_line: str = ""
@@ -312,6 +315,9 @@ def observe_ws_to_mcp(target: str, text: str) -> None:
     state.last_tool_result_at = ""
     state.last_tool_result_ok = None
     state.last_tool_error = ""
+    state.last_tool_content_chars = 0
+    state.last_tool_content_empty = None
+    state.last_tool_content_preview = ""
 
     request_id = payload.get("id")
     if request_id is not None:
@@ -322,6 +328,46 @@ def observe_ws_to_mcp(target: str, text: str) -> None:
         )
 
     logger.info("[%s] MCP tools/call -> %s", target, tool_name or "<unknown>")
+
+
+def extract_mcp_result_text(result: Any) -> str:
+    """Extract user-visible MCP result text for diagnostics only.
+
+    This function never modifies the response sent back to Xiaozhi.
+    """
+    if isinstance(result, str):
+        return result.strip()
+    if not isinstance(result, dict):
+        return ""
+
+    parts: List[str] = []
+    content = result.get("content")
+    if isinstance(content, list):
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            value = item.get("text")
+            if isinstance(value, str) and value.strip():
+                parts.append(value.strip())
+
+    if not parts and result.get("structuredContent") is not None:
+        try:
+            parts.append(
+                json.dumps(
+                    result.get("structuredContent"),
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            )
+        except Exception:
+            pass
+
+    return "\n".join(parts).strip()
+
+
+def compact_preview(text: str, limit: int = 320) -> str:
+    compact = re.sub(r"\s+", " ", text or "").strip()
+    return sanitize_diag_text(compact)[:limit]
 
 
 def observe_mcp_to_ws(target: str, text: str) -> None:
@@ -362,23 +408,51 @@ def observe_mcp_to_ws(target: str, text: str) -> None:
     if isinstance(result, dict):
         is_error = bool(result.get("isError", False))
 
-    state.last_tool_result_ok = not is_error
+    tool_name = pending[1]
+    content_text = extract_mcp_result_text(result)
+    content_chars = len(content_text)
+    content_empty = content_chars == 0
+    preview = compact_preview(content_text)
+
+    state.last_tool_content_chars = content_chars
+    state.last_tool_content_empty = content_empty
+    state.last_tool_content_preview = preview
 
     if is_error:
+        state.last_tool_result_ok = False
         state.last_tool_error = sanitize_diag_text(
             json.dumps(result, ensure_ascii=False)
         )
         logger.warning(
-            "[%s] MCP tool result isError=true | tool=%s",
+            "[%s] MCP tool result isError=true | tool=%s | chars=%s",
             target,
-            pending[1],
+            tool_name,
+            content_chars,
         )
-    else:
-        logger.info(
-            "[%s] MCP tool result OK | tool=%s",
+        return
+
+    # A JSON-RPC success with empty content is not a usable Internet result for
+    # search/fetch_content. Mark it clearly so /status and Render logs do not
+    # misleadingly report PASS. Other MCP tools may legitimately return no text.
+    if tool_name in {"search", "fetch_content"} and content_empty:
+        state.last_tool_result_ok = False
+        state.last_tool_error = "MCP returned success envelope but empty usable content"
+        logger.warning(
+            "[%s] MCP tool result EMPTY | tool=%s | chars=0",
             target,
-            pending[1],
+            tool_name,
         )
+        return
+
+    state.last_tool_result_ok = True
+    state.last_tool_error = ""
+    logger.info(
+        "[%s] MCP tool result OK | tool=%s | chars=%s | preview=%s",
+        target,
+        tool_name,
+        content_chars,
+        preview or "<no-text>",
+    )
 
 
 def observe_mcp_stderr(target: str, text: str) -> None:

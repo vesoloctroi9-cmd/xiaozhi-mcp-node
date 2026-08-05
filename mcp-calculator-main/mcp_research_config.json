@@ -1,0 +1,20 @@
+{
+  "mcpServers": {
+    "duckduckgo-web-search": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": [
+        "--with",
+        "duckduckgo-mcp-server[browser]",
+        "duckduckgo-mcp-server",
+        "--fetch-backend",
+        "auto"
+      ],
+      "env": {
+        "DDG_SAFE_SEARCH": "STRICT",
+        "DDG_REGION": "wt-wt",
+        "DDG_SEARCH_BACKEND": "auto"
+      }
+    }
+  }
+}

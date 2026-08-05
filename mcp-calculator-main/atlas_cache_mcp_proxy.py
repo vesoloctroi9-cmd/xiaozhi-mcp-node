@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ATLAS CACHE-FIRST MCP PROXY
-Version: 1.0.0
+Version: 1.1.0
 
 Purpose
 -------
@@ -25,7 +25,7 @@ Alternative:
 Optional:
   ATLAS_CACHE_REFRESH_SECONDS=60
   ATLAS_CACHE_MAX_AGE_SECONDS=3600
-  ATLAS_CACHE_TIMEOUT_SECONDS=8
+  ATLAS_CACHE_TIMEOUT_SECONDS=3
   ATLAS_CACHE_MIN_SCORE=1
   ATLAS_CACHE_MAX_SEARCH_CHARS=9000
   ATLAS_CACHE_MAX_FETCH_CHARS=12000
@@ -44,6 +44,7 @@ import os
 import re
 import sys
 import unicodedata
+from urllib.parse import urlsplit, urlunsplit
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -51,7 +52,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 from aiohttp import ClientSession, ClientTimeout
 
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 LOGGER = logging.getLogger("ATLAS_CACHE_PROXY")
 logging.basicConfig(
     level=os.environ.get("MCP_LOG_LEVEL", "INFO").upper(),
@@ -72,7 +73,7 @@ def env_int(name: str, default: int, minimum: int, maximum: int) -> int:
 
 CACHE_REFRESH_SECONDS = env_int("ATLAS_CACHE_REFRESH_SECONDS", 60, 15, 600)
 CACHE_MAX_AGE_SECONDS = env_int("ATLAS_CACHE_MAX_AGE_SECONDS", 3600, 60, 86400)
-CACHE_TIMEOUT_SECONDS = env_int("ATLAS_CACHE_TIMEOUT_SECONDS", 8, 2, 30)
+CACHE_TIMEOUT_SECONDS = env_int("ATLAS_CACHE_TIMEOUT_SECONDS", 3, 1, 15)
 CACHE_MIN_SCORE = env_int("ATLAS_CACHE_MIN_SCORE", 1, 1, 10)
 CACHE_MAX_SEARCH_CHARS = env_int("ATLAS_CACHE_MAX_SEARCH_CHARS", 9000, 1000, 20000)
 CACHE_MAX_FETCH_CHARS = env_int("ATLAS_CACHE_MAX_FETCH_CHARS", 12000, 1000, 30000)
@@ -143,10 +144,27 @@ def parse_iso(value: str) -> Optional[datetime]:
     return dt.astimezone(timezone.utc)
 
 
+def cache_bypass_enabled() -> bool:
+    # GitHub Research Worker must always use LIVE DuckDuckGo so the cache does not
+    # feed itself. Explicit ATLAS_CACHE_BYPASS is also supported for diagnostics.
+    raw = os.environ.get("ATLAS_CACHE_BYPASS", "").strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    return os.environ.get("GITHUB_ACTIONS", "").strip().lower() == "true"
+
+
 def derive_cache_url() -> str:
     explicit = os.environ.get("ATLAS_RESEARCH_CACHE_URL", "").strip()
     if explicit:
         return explicit
+
+    # Backward-compatible alias: the current Render environment used this key.
+    legacy = os.environ.get("RESEARCH_CACHE_URL", "").strip()
+    if legacy:
+        LOGGER.warning(
+            "RESEARCH_CACHE_URL is deprecated; prefer ATLAS_RESEARCH_CACHE_URL"
+        )
+        return legacy
 
     repo = (
         os.environ.get("ATLAS_GITHUB_REPOSITORY", "").strip()
@@ -156,6 +174,30 @@ def derive_cache_url() -> str:
         return ""
     owner, name = repo.split("/", 1)
     return f"https://{owner}.github.io/{name}/atlas_research.json"
+
+
+def canonical_url_for_cache(value: str) -> str:
+    """Conservative URL equality for cached fetched_text.
+
+    Keep query parameters because they can select different content. Ignore only
+    fragments, host/scheme case and a trailing slash. Correctness is preferred
+    over a cache hit: a non-identical article must fall back to LIVE fetch.
+    """
+    raw = (value or "").strip()
+    if not raw:
+        return ""
+    try:
+        parts = urlsplit(raw)
+    except Exception:
+        return raw.rstrip("/")
+    if not parts.scheme or not parts.netloc:
+        return raw.rstrip("/")
+    path = parts.path or "/"
+    if path != "/":
+        path = path.rstrip("/")
+    return urlunsplit(
+        (parts.scheme.lower(), parts.netloc.lower(), path, parts.query, "")
+    )
 
 
 def upstream_command() -> List[str]:
@@ -184,6 +226,7 @@ def upstream_command() -> List[str]:
 class CacheSnapshot:
     payload: Optional[Dict[str, Any]] = None
     fetched_at_monotonic: float = 0.0
+    last_attempt_monotonic: float = 0.0
     source_url: str = ""
     last_error: str = ""
     hits_search: int = 0
@@ -197,28 +240,34 @@ class ResearchCache:
         self._lock = asyncio.Lock()
 
     def configured(self) -> bool:
-        return bool(self.state.source_url)
+        return bool(self.state.source_url) and not cache_bypass_enabled()
 
     async def refresh(self, *, force: bool = False) -> Optional[Dict[str, Any]]:
         if not self.configured():
             return None
 
         loop = asyncio.get_running_loop()
+        now = loop.time()
+
+        # Fail-fast throttle applies to both PASS and FAIL attempts. This prevents
+        # every tool call from waiting on the same broken/404 cache URL.
         if (
             not force
-            and self.state.payload is not None
-            and loop.time() - self.state.fetched_at_monotonic < CACHE_REFRESH_SECONDS
+            and self.state.last_attempt_monotonic > 0
+            and now - self.state.last_attempt_monotonic < CACHE_REFRESH_SECONDS
         ):
             return self.state.payload
 
         async with self._lock:
+            now = loop.time()
             if (
                 not force
-                and self.state.payload is not None
-                and loop.time() - self.state.fetched_at_monotonic < CACHE_REFRESH_SECONDS
+                and self.state.last_attempt_monotonic > 0
+                and now - self.state.last_attempt_monotonic < CACHE_REFRESH_SECONDS
             ):
                 return self.state.payload
 
+            self.state.last_attempt_monotonic = now
             timeout = ClientTimeout(total=CACHE_TIMEOUT_SECONDS)
             try:
                 async with ClientSession(timeout=timeout) as session:
@@ -252,7 +301,11 @@ class ResearchCache:
                 return payload
             except Exception as exc:
                 self.state.last_error = str(exc)
-                LOGGER.warning("[CACHE] REFRESH FAIL | %s", exc)
+                LOGGER.warning(
+                    "[CACHE] REFRESH FAIL | %s | fallback=LIVE | retry_after=%ss",
+                    exc,
+                    CACHE_REFRESH_SECONDS,
+                )
                 return self.state.payload
 
     def fresh(self, payload: Optional[Dict[str, Any]]) -> bool:
@@ -374,21 +427,24 @@ class ResearchCache:
         payload = await self.refresh()
         if not self.fresh(payload):
             self.state.misses += 1
+            LOGGER.info("[CACHE] FETCH MISS | stale/unavailable cache | fallback=LIVE")
             return None
 
         assert payload is not None
         target = url.strip()
+        target_key = canonical_url_for_cache(target)
+
         for raw in payload.get("items", []) or []:
             if not isinstance(raw, dict):
                 continue
+
+            # IMPORTANT CORRECTNESS RULE:
+            # fetched_text belongs ONLY to fetched_url. The item's other search
+            # URLs may point to different articles and must never reuse this text.
             fetched_url = str(raw.get("fetched_url", "")).strip()
-            urls = raw.get("urls", []) or []
-            if not isinstance(urls, list):
-                urls = []
-            url_set = {str(x).strip() for x in urls if str(x).strip()}
-            if fetched_url:
-                url_set.add(fetched_url)
-            if target not in url_set:
+            if not fetched_url:
+                continue
+            if canonical_url_for_cache(fetched_url) != target_key:
                 continue
 
             text = str(raw.get("fetched_text", "")).strip()
@@ -410,13 +466,13 @@ class ResearchCache:
             )
             return (
                 "ATLAS CACHE HIT — cached fetched content\n"
-                f"URL: {target}\n"
+                f"URL: {fetched_url}\n"
                 f"Cache generated_at: {payload.get('generated_at', '')}\n\n"
                 f"{sliced}"
             )
 
         self.state.misses += 1
-        LOGGER.info("[CACHE] FETCH MISS | url=%s", target[:240])
+        LOGGER.info("[CACHE] FETCH MISS | url=%s | fallback=LIVE", target[:240])
         return None
 
 
@@ -482,7 +538,11 @@ async def maybe_intercept_tool_call(message: str) -> Optional[str]:
         except (TypeError, ValueError):
             max_results = 10
         hit = await CACHE.search_hit(query, max_results)
-        return mcp_text_response(request_id, hit) if hit else None
+        if hit:
+            LOGGER.info("[CACHE] ROUTE | tool=search | source=CACHE")
+            return mcp_text_response(request_id, hit)
+        LOGGER.info("[CACHE] ROUTE | tool=search | source=LIVE")
+        return None
 
     if name == "fetch_content":
         url = str(arguments.get("url", "")).strip()
@@ -497,15 +557,23 @@ async def maybe_intercept_tool_call(message: str) -> Optional[str]:
         except (TypeError, ValueError):
             max_length = 8000
         hit = await CACHE.fetch_hit(url, start_index, max_length)
-        return mcp_text_response(request_id, hit) if hit else None
+        if hit:
+            LOGGER.info("[CACHE] ROUTE | tool=fetch_content | source=CACHE")
+            return mcp_text_response(request_id, hit)
+        LOGGER.info("[CACHE] ROUTE | tool=fetch_content | source=LIVE")
+        return None
 
     return None
 
 
 async def warm_cache_loop() -> None:
+    if cache_bypass_enabled():
+        LOGGER.info("[CACHE] BYPASS | environment requests LIVE-only mode")
+        return
     if not CACHE.configured():
         LOGGER.warning(
-            "[CACHE] DISABLED | set ATLAS_RESEARCH_CACHE_URL or ATLAS_GITHUB_REPOSITORY"
+            "[CACHE] DISABLED | set ATLAS_RESEARCH_CACHE_URL (or legacy RESEARCH_CACHE_URL) "
+            "or ATLAS_GITHUB_REPOSITORY"
         )
         return
 
