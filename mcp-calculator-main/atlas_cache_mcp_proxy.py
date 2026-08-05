@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ATLAS CACHE-FIRST MCP PROXY
-Version: 1.0.0
+Version: 1.0.1 (Fix I/O blocking & Stale handling)
 
 Purpose
 -------
@@ -13,26 +13,6 @@ Purpose
 - Falls back transparently to the live DuckDuckGo MCP server on cache miss,
   stale cache, disabled cache, or cache/network errors.
 - Does NOT create a keep-alive mechanism and does NOT replace Render's bridge.
-
-Render/GitHub cache configuration
----------------------------------
-Preferred:
-  ATLAS_RESEARCH_CACHE_URL=https://OWNER.github.io/REPO/atlas_research.json
-
-Alternative:
-  ATLAS_GITHUB_REPOSITORY=OWNER/REPO
-
-Optional:
-  ATLAS_CACHE_REFRESH_SECONDS=60
-  ATLAS_CACHE_MAX_AGE_SECONDS=3600
-  ATLAS_CACHE_TIMEOUT_SECONDS=8
-  ATLAS_CACHE_MIN_SCORE=1
-  ATLAS_CACHE_MAX_SEARCH_CHARS=9000
-  ATLAS_CACHE_MAX_FETCH_CHARS=12000
-
-The upstream DuckDuckGo MCP command defaults to:
-  uvx --with duckduckgo-mcp-server[browser] duckduckgo-mcp-server
-      --fetch-backend auto
 """
 
 from __future__ import annotations
@@ -46,12 +26,11 @@ import sys
 import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from aiohttp import ClientSession, ClientTimeout
 
-
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 LOGGER = logging.getLogger("ATLAS_CACHE_PROXY")
 logging.basicConfig(
     level=os.environ.get("MCP_LOG_LEVEL", "INFO").upper(),
@@ -77,7 +56,6 @@ CACHE_MIN_SCORE = env_int("ATLAS_CACHE_MIN_SCORE", 1, 1, 10)
 CACHE_MAX_SEARCH_CHARS = env_int("ATLAS_CACHE_MAX_SEARCH_CHARS", 9000, 1000, 20000)
 CACHE_MAX_FETCH_CHARS = env_int("ATLAS_CACHE_MAX_FETCH_CHARS", 12000, 1000, 30000)
 
-
 GENERIC_TOKENS = {
     # Vietnamese question/news/freshness glue.
     "tin", "tuc", "moi", "nhat", "hom", "nay", "bay", "gio", "doc", "cho",
@@ -95,10 +73,6 @@ NEWS_HINTS = {
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
-
-
-def utc_now_iso() -> str:
-    return utc_now().isoformat()
 
 
 def normalize_text(value: str) -> str:
@@ -421,7 +395,7 @@ class ResearchCache:
 
 
 CACHE = ResearchCache()
-STDOUT_LOCK: Optional[asyncio.Lock] = None
+STDOUT_LOCK = asyncio.Lock()
 
 
 def mcp_text_response(request_id: Any, text: str) -> str:
@@ -442,9 +416,6 @@ def mcp_text_response(request_id: Any, text: str) -> str:
 
 
 async def write_stdout(line: str) -> None:
-    global STDOUT_LOCK
-    if STDOUT_LOCK is None:
-        STDOUT_LOCK = asyncio.Lock()
     async with STDOUT_LOCK:
         sys.stdout.write(line.rstrip("\r\n") + "\n")
         sys.stdout.flush()
@@ -520,18 +491,34 @@ async def warm_cache_loop() -> None:
         await asyncio.sleep(CACHE_REFRESH_SECONDS)
 
 
+async def create_async_stdin_reader() -> asyncio.StreamReader:
+    reader = asyncio.StreamReader()
+    protocol = asyncio.StreamReaderProtocol(reader)
+    loop = asyncio.get_running_loop()
+    await loop.connect_read_pipe(lambda: protocol, sys.stdin)
+    return reader
+
+
 async def parent_to_child(process: asyncio.subprocess.Process) -> None:
     if process.stdin is None:
         raise RuntimeError("upstream MCP stdin unavailable")
 
+    try:
+        reader = await create_async_stdin_reader()
+    except Exception as exc:
+        LOGGER.warning("Could not attach async pipe reader for stdin, falling back: %s", exc)
+        reader = None
+
     while True:
-        line = await asyncio.to_thread(sys.stdin.readline)
-        if line == "":
-            try:
-                process.stdin.close()
-            except Exception:
-                pass
-            return
+        if reader is not None:
+            line_bytes = await reader.readline()
+            if not line_bytes:
+                break
+            line = line_bytes.decode("utf-8", errors="replace")
+        else:
+            line = await asyncio.to_thread(sys.stdin.readline)
+            if line == "":
+                break
 
         message = line.rstrip("\r\n")
         if not message:
@@ -544,6 +531,11 @@ async def parent_to_child(process: asyncio.subprocess.Process) -> None:
 
         process.stdin.write((message + "\n").encode("utf-8"))
         await process.stdin.drain()
+
+    try:
+        process.stdin.close()
+    except Exception:
+        pass
 
 
 async def child_to_parent(process: asyncio.subprocess.Process) -> None:
@@ -565,7 +557,6 @@ async def child_stderr(process: asyncio.subprocess.Process) -> None:
         if not raw:
             return
         text = raw.decode("utf-8", errors="replace").rstrip("\r\n")
-        # Keep upstream diagnostics visible in Render logs via mcp_pipe stderr reader.
         print(f"[UPSTREAM_DDG] {text}", file=sys.stderr, flush=True)
 
 
