@@ -1,874 +1,521 @@
-#!/usr/bin/env python3
-"""
-ATLAS MULTI-SOURCE MCP PROXY
-Version: 2.0.0
-
-Route order for search:
-  1) Fresh GitHub Pages research cache
-  2) Tavily Search API (if TAVILY_API_KEY is configured)
-  3) SerpApi Google Search (if SERPAPI_API_KEY is configured)
-  4) Upstream DuckDuckGo MCP server
-
-Route order for fetch_content:
-  1) Fresh GitHub Pages cached fetched_text
-  2) Tavily Extract API (if TAVILY_API_KEY is configured)
-  3) Upstream DuckDuckGo MCP fetch_content
-
-This proxy preserves the upstream MCP server for initialize/tools/list and for all
-unhandled requests. It does not create a keep-alive mechanism.
-"""
-
-from __future__ import annotations
-
 import asyncio
-import ipaddress
 import json
-import logging
 import os
-import re
-import sys
-import unicodedata
-from dataclasses import dataclass
+import unittest
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlsplit, urlunsplit
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
-from aiohttp import ClientSession, ClientTimeout
-
-VERSION = "2.0.0"
-LOGGER = logging.getLogger("ATLAS_MULTI_PROXY")
-logging.basicConfig(
-    level=os.environ.get("MCP_LOG_LEVEL", "INFO").upper(),
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    stream=sys.stderr,
-)
+import atlas_multi_source_final_v1 as m
 
 
-def env_int(name: str, default: int, minimum: int, maximum: int) -> int:
-    raw = os.environ.get(name, "").strip()
-    try:
-        value = int(raw) if raw else default
-    except ValueError:
-        LOGGER.warning("%s=%r invalid; using %s", name, raw, default)
-        value = default
-    return max(minimum, min(maximum, value))
+class FakeRouter:
+    def __init__(self, ddg_text="", fetch_text="DDG FETCH"):
+        self.ddg_text = ddg_text
+        self.fetch_text = fetch_text
+        self.calls = []
+
+    async def call_tool(self, name, arguments, timeout):
+        self.calls.append((name, arguments, timeout))
+        if name == "search":
+            return {
+                "jsonrpc": "2.0",
+                "id": "internal",
+                "result": {
+                    "content": [{"type": "text", "text": self.ddg_text}],
+                    "isError": False,
+                },
+            }
+        if name == "fetch_content":
+            return {
+                "jsonrpc": "2.0",
+                "id": "internal",
+                "result": {
+                    "content": [{"type": "text", "text": self.fetch_text}],
+                    "isError": False,
+                },
+            }
+        return {"error": "unknown"}
 
 
-CACHE_REFRESH_SECONDS = env_int("ATLAS_CACHE_REFRESH_SECONDS", 60, 15, 600)
-CACHE_MAX_AGE_SECONDS = env_int("ATLAS_CACHE_MAX_AGE_SECONDS", 3600, 60, 86400)
-CACHE_TIMEOUT_SECONDS = env_int("ATLAS_CACHE_TIMEOUT_SECONDS", 3, 1, 15)
-CACHE_MIN_SCORE = env_int("ATLAS_CACHE_MIN_SCORE", 1, 1, 10)
-CACHE_MAX_SEARCH_CHARS = env_int("ATLAS_CACHE_MAX_SEARCH_CHARS", 9000, 1000, 20000)
-CACHE_MAX_FETCH_CHARS = env_int("ATLAS_CACHE_MAX_FETCH_CHARS", 12000, 1000, 30000)
-WEB_TIMEOUT_SECONDS = env_int("ATLAS_WEB_TIMEOUT_SECONDS", 12, 3, 30)
-TAVILY_MAX_RESULTS = env_int("ATLAS_TAVILY_MAX_RESULTS", 5, 1, 10)
-SERPAPI_MAX_RESULTS = env_int("ATLAS_SERPAPI_MAX_RESULTS", 5, 1, 10)
-
-TAVILY_SEARCH_URL = "https://api.tavily.com/search"
-TAVILY_EXTRACT_URL = "https://api.tavily.com/extract"
-SERPAPI_SEARCH_URL = "https://serpapi.com/search.json"
-
-GENERIC_TOKENS = {
-    "tin", "tuc", "moi", "nhat", "hom", "nay", "bay", "gio", "doc", "cho",
-    "toi", "ve", "la", "gi", "co", "nhung", "cac", "va", "cua", "tren", "the",
-    "nao", "cap", "nhat", "thoi", "su", "xem", "tim", "kiem", "noi", "dung",
-    "news", "latest", "today", "read", "search", "find", "about", "what", "the",
-    "and", "for", "from", "update", "updates", "current", "recent",
-}
-NEWS_HINTS = {
-    "tin", "tuc", "news", "latest", "moi", "nhat", "hom", "nay", "today",
-    "thoi", "su", "update", "updates", "recent", "current",
-}
-
-# Keep web lookup appropriate for a general assistant. Informational/news queries are
-# not blanket-blocked; only clear requests to locate/access restricted material are stopped.
-RESTRICTED_PATTERNS = [
-    re.compile(r"\b(porn|pornography|xxx|sex\s*video|adult\s*video)\b", re.I),
-    re.compile(r"\b(buy|mua|order|dat mua)\b.{0,35}\b(gun|firearm|ammo|ammunition|sung|dao bam|switchblade)\b", re.I),
-    re.compile(r"\b(buy|mua|order|dat mua|how to use|cach dung)\b.{0,35}\b(cocaine|heroin|meth|fentanyl|ma tuy|can sa|marijuana|thc)\b", re.I),
-    re.compile(r"\b(bet|betting|sportsbook|casino|gambling|ca cuoc|danh bac|keo cuoc)\b", re.I),
-]
+def ev(provider, url, title="atlas", snippet="atlas research", query="atlas", score=0.0):
+    return m.Evidence(
+        title=title,
+        url=url,
+        snippet=snippet,
+        provider=provider,
+        source_query=query,
+        provider_score=score,
+    ).finalize()
 
 
-def utc_now() -> datetime:
-    return datetime.now(timezone.utc)
+class CoreSelfTest(unittest.TestCase):
+    def test_001_version(self):
+        self.assertEqual(m.VERSION, "1.0.0")
+
+    def test_002_normalize_vietnamese(self):
+        self.assertEqual(m.normalize_text("Tin MỚI Việt Nam"), "tin moi viet nam")
+
+    def test_003_tokens_remove_generic(self):
+        self.assertEqual(m.tokens("tin mới ATLAS hôm nay"), ["atlas"])
+
+    def test_004_tokens_dedup(self):
+        self.assertEqual(m.tokens("atlas atlas research"), ["atlas", "research"])
+
+    def test_005_news_vi(self):
+        self.assertTrue(m.has_news_intent("tin mới AI hôm nay"))
+
+    def test_006_news_en(self):
+        self.assertTrue(m.has_news_intent("latest AI news"))
+
+    def test_007_history_not_news(self):
+        self.assertFalse(m.has_news_intent("lịch sử máy tính"))
+
+    def test_008_thoi_su_news(self):
+        self.assertTrue(m.has_news_intent("thời sự Việt Nam"))
+
+    def test_009_restricted_gambling(self):
+        self.assertTrue(m.query_is_restricted("casino gambling hôm nay"))
+
+    def test_010_normal_query_not_restricted(self):
+        self.assertFalse(m.query_is_restricted("tin công nghệ Việt Nam"))
+
+    def test_011_parse_iso_z(self):
+        self.assertIsNotNone(m.parse_iso("2026-08-07T10:00:00Z"))
+
+    def test_012_parse_iso_invalid(self):
+        self.assertIsNone(m.parse_iso("invalid"))
+
+    def test_013_public_https(self):
+        self.assertTrue(m.is_public_http_url("https://example.com/a"))
+
+    def test_014_private_ip_block(self):
+        self.assertFalse(m.is_public_http_url("http://127.0.0.1/x"))
+
+    def test_015_localhost_block(self):
+        self.assertFalse(m.is_public_http_url("http://localhost/x"))
+
+    def test_016_non_http_block(self):
+        self.assertFalse(m.is_public_http_url("file:///tmp/a"))
+
+    def test_017_canonical_fragment(self):
+        self.assertEqual(m.canonicalize_url("HTTPS://Example.COM/a/#x"), "https://example.com/a")
+
+    def test_018_canonical_tracking(self):
+        self.assertEqual(
+            m.canonicalize_url("https://example.com/a?id=1&utm_source=x&fbclid=y"),
+            "https://example.com/a?id=1",
+        )
+
+    def test_019_canonical_semantic_query(self):
+        self.assertEqual(
+            m.canonicalize_url("https://example.com/s?q=atlas&page=2"),
+            "https://example.com/s?q=atlas&page=2",
+        )
+
+    def test_020_platform_fb(self):
+        self.assertEqual(m.platform_of("https://www.facebook.com/x"), "facebook")
+
+    def test_021_platform_tiktok(self):
+        self.assertEqual(m.platform_of("https://www.tiktok.com/@x/video/1"), "tiktok")
+
+    def test_022_platform_youtube(self):
+        self.assertEqual(m.platform_of("https://youtu.be/abc"), "youtube")
+
+    def test_023_platform_web(self):
+        self.assertEqual(m.platform_of("https://example.com"), "web")
+
+    def test_024_query_plan_social(self):
+        with patch.object(m, "SOCIAL_DISCOVERY_ENABLED", True):
+            queries = [x.query for x in m.build_query_plan("AI Việt Nam")]
+        self.assertEqual(len(queries), 4)
+        self.assertIn("site:facebook.com AI Việt Nam", queries)
+        self.assertIn("site:tiktok.com AI Việt Nam", queries)
+        self.assertIn("site:youtube.com AI Việt Nam", queries)
+
+    def test_025_query_plan_social_off(self):
+        with patch.object(m, "SOCIAL_DISCOVERY_ENABLED", False):
+            queries = [x.query for x in m.build_query_plan("AI")]
+        self.assertEqual(queries, ["AI"])
+
+    def test_026_query_plan_empty(self):
+        with self.assertRaises(ValueError):
+            m.build_query_plan("  ")
+
+    def test_027_mcp_text_roundtrip(self):
+        raw = m.mcp_text_response(7, "hello")
+        obj = json.loads(raw)
+        self.assertEqual(obj["id"], 7)
+        self.assertEqual(m.extract_mcp_text(obj), "hello")
+
+    def test_028_ddg_markdown_parser(self):
+        rows = m.parse_ddg_evidence(
+            "[ATLAS News](https://example.com/a) useful snippet",
+            m.PlannedQuery("atlas", "base"),
+            5,
+        )
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].title, "ATLAS News")
+
+    def test_029_ddg_plain_url_parser(self):
+        rows = m.parse_ddg_evidence(
+            "ATLAS result\nhttps://example.com/a\nmore detail",
+            m.PlannedQuery("atlas", "base"),
+            5,
+        )
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].title, "ATLAS result")
+
+    def test_030_ddg_parser_dedup(self):
+        text = "[A](https://example.com/a)\nhttps://example.com/a"
+        rows = m.parse_ddg_evidence(text, m.PlannedQuery("a", "base"), 10)
+        self.assertEqual(len(rows), 1)
+
+    def test_031_dedup_provider_merge(self):
+        rows = m.deduplicate([
+            ev("cache", "https://same.test/a?utm_source=x"),
+            ev("tavily", "https://same.test/a", snippet="longer atlas research snippet"),
+        ])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(set(rows[0].providers), {"cache", "tavily"})
+
+    def test_032_dedup_query_preserved(self):
+        rows = m.deduplicate([
+            ev("cache", "https://same.test/s?q=a&page=1"),
+            ev("cache", "https://same.test/s?q=a&page=2"),
+        ])
+        self.assertEqual(len(rows), 2)
+
+    def test_033_relevance_ranking(self):
+        good = ev("x", "https://good.test", title="atlas research", snippet="atlas research")
+        bad = ev("x", "https://bad.test", title="cooking", snippet="recipe")
+        self.assertGreater(m.evidence_rank_score(good, "atlas research"), m.evidence_rank_score(bad, "atlas research"))
+
+    def test_034_multi_provider_bonus(self):
+        a = ev("cache", "https://a.test")
+        b = ev("cache", "https://b.test")
+        m.merge_evidence(a, ev("tavily", "https://a.test"))
+        self.assertGreater(m.evidence_rank_score(a, "atlas"), m.evidence_rank_score(b, "atlas"))
+
+    def test_035_domain_limit(self):
+        rows = [ev("x", f"https://same.test/{i}") for i in range(8)]
+        ranked = m.rank_and_diversify(rows, "atlas", limit=20, max_per_domain=2)
+        self.assertEqual(len(ranked), 2)
+
+    def test_036_global_limit(self):
+        rows = [ev("x", f"https://d{i}.test/a") for i in range(8)]
+        ranked = m.rank_and_diversify(rows, "atlas", limit=3, max_per_domain=5)
+        self.assertEqual(len(ranked), 3)
+
+    def test_037_format_has_cache_policy(self):
+        states = {x: m.ProviderState(x, True, ok=1, rows=1) for x in ("cache","tavily","serpapi","duckduckgo")}
+        text = m.format_search_response("atlas", [ev("tavily", "https://a.test")], states)
+        self.assertIn("Cache policy: supplemental", text)
+
+    def test_038_format_social_label(self):
+        states = {x: m.ProviderState(x, False) for x in ("cache","tavily","serpapi","duckduckgo")}
+        text = m.format_search_response("atlas", [ev("serpapi", "https://facebook.com/a")], states)
+        self.assertIn("public/search-indexed", text)
+
+    def test_039_upstream_default_command(self):
+        with patch.dict(os.environ, {"ATLAS_DDG_CHILD_COMMAND": "", "ATLAS_DDG_CHILD_ARGS_JSON": ""}, clear=False):
+            cmd = m.upstream_command()
+        self.assertEqual(cmd[0], "uvx")
+        self.assertIn("duckduckgo-mcp-server", cmd)
+
+    def test_040_upstream_json_args(self):
+        with patch.dict(os.environ, {"ATLAS_DDG_CHILD_COMMAND": "python", "ATLAS_DDG_CHILD_ARGS_JSON": '["-m","x"]'}, clear=False):
+            self.assertEqual(m.upstream_command(), ["python", "-m", "x"])
 
 
-def normalize_text(value: str) -> str:
-    text = unicodedata.normalize("NFD", value or "")
-    text = "".join(ch for ch in text if unicodedata.category(ch) != "Mn")
-    text = text.lower()
-    text = re.sub(r"[^a-z0-9]+", " ", text)
-    return " ".join(text.split())
+class AggregateFallbackSimulation(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.router = FakeRouter("[DDG](https://ddg.test/a) atlas research")
+        self.cache_rows = [ev("cache", "https://cache.test/a")]
+        self.tavily_rows = [ev("tavily", "https://tavily.test/a")]
+        self.serp_rows = [ev("serpapi", "https://serp.test/a")]
+
+    async def _run(self, cache=None, tavily=None, serp=None, ddg_text=None, social=False):
+        if ddg_text is not None:
+            self.router.ddg_text = ddg_text
+        async def fake_cache(planned, max_results):
+            return list(self.cache_rows if cache is None else cache)
+        async def fake_tavily(planned, max_results, news):
+            return list(self.tavily_rows if tavily is None else tavily)
+        async def fake_serp(planned, max_results, news):
+            return list(self.serp_rows if serp is None else serp)
+        with patch.object(m.CACHE, "configured", return_value=True), \
+             patch.object(m.CACHE, "search", side_effect=fake_cache), \
+             patch.object(m, "tavily_search", side_effect=fake_tavily), \
+             patch.object(m, "serpapi_search", side_effect=fake_serp), \
+             patch.dict(os.environ, {"TAVILY_API_KEY": "t", "SERPAPI_API_KEY": "s"}, clear=False), \
+             patch.object(m, "SOCIAL_DISCOVERY_ENABLED", social):
+            return await m.aggregate_search("atlas", 16, self.router)
+
+    async def test_101_all_four_sources_contribute(self):
+        results, states = await self._run()
+        self.assertEqual(len(results), 4)
+        self.assertEqual(states["cache"].ok, 1)
+        self.assertEqual(states["tavily"].ok, 1)
+        self.assertEqual(states["serpapi"].ok, 1)
+        self.assertEqual(states["duckduckgo"].ok, 1)
+
+    async def test_102_cache_hit_does_not_stop_live(self):
+        results, states = await self._run()
+        self.assertTrue(any("cache" in x.providers for x in results))
+        self.assertTrue(any("tavily" in x.providers for x in results))
+        self.assertTrue(any("serpapi" in x.providers for x in results))
+        self.assertEqual(len(self.router.calls), 1)
+
+    async def test_103_cache_failure_isolated(self):
+        async def fail_cache(planned, max_results):
+            raise RuntimeError("cache fail")
+        with patch.object(m.CACHE, "configured", return_value=True), \
+             patch.object(m.CACHE, "search", side_effect=fail_cache), \
+             patch.object(m, "tavily_search", return_value=self.tavily_rows), \
+             patch.object(m, "serpapi_search", return_value=self.serp_rows), \
+             patch.dict(os.environ, {"TAVILY_API_KEY":"t", "SERPAPI_API_KEY":"s"}, clear=False), \
+             patch.object(m, "SOCIAL_DISCOVERY_ENABLED", False):
+            results, states = await m.aggregate_search("atlas", 16, self.router)
+        self.assertGreaterEqual(len(results), 3)
+        self.assertEqual(states["cache"].failed, 1)
+
+    async def test_104_tavily_failure_isolated(self):
+        async def fail(*args):
+            raise RuntimeError("tavily fail")
+        with patch.object(m.CACHE, "configured", return_value=True), \
+             patch.object(m.CACHE, "search", return_value=self.cache_rows), \
+             patch.object(m, "tavily_search", side_effect=fail), \
+             patch.object(m, "serpapi_search", return_value=self.serp_rows), \
+             patch.dict(os.environ, {"TAVILY_API_KEY":"t", "SERPAPI_API_KEY":"s"}, clear=False), \
+             patch.object(m, "SOCIAL_DISCOVERY_ENABLED", False):
+            results, states = await m.aggregate_search("atlas", 16, self.router)
+        self.assertGreaterEqual(len(results), 3)
+        self.assertEqual(states["tavily"].failed, 1)
+
+    async def test_105_serp_failure_isolated(self):
+        async def fail(*args):
+            raise RuntimeError("serp fail")
+        with patch.object(m.CACHE, "configured", return_value=True), \
+             patch.object(m.CACHE, "search", return_value=self.cache_rows), \
+             patch.object(m, "tavily_search", return_value=self.tavily_rows), \
+             patch.object(m, "serpapi_search", side_effect=fail), \
+             patch.dict(os.environ, {"TAVILY_API_KEY":"t", "SERPAPI_API_KEY":"s"}, clear=False), \
+             patch.object(m, "SOCIAL_DISCOVERY_ENABLED", False):
+            results, states = await m.aggregate_search("atlas", 16, self.router)
+        self.assertGreaterEqual(len(results), 3)
+        self.assertEqual(states["serpapi"].failed, 1)
+
+    async def test_106_ddg_failure_isolated(self):
+        class BadRouter:
+            async def call_tool(self, *args, **kwargs):
+                raise RuntimeError("ddg fail")
+        with patch.object(m.CACHE, "configured", return_value=True), \
+             patch.object(m.CACHE, "search", return_value=self.cache_rows), \
+             patch.object(m, "tavily_search", return_value=self.tavily_rows), \
+             patch.object(m, "serpapi_search", return_value=self.serp_rows), \
+             patch.dict(os.environ, {"TAVILY_API_KEY":"t", "SERPAPI_API_KEY":"s"}, clear=False), \
+             patch.object(m, "SOCIAL_DISCOVERY_ENABLED", False):
+            results, states = await m.aggregate_search("atlas", 16, BadRouter())
+        self.assertEqual(len(results), 3)
+        self.assertEqual(states["duckduckgo"].failed, 1)
+
+    async def test_107_three_fail_one_survives(self):
+        async def fail_cache(*args): raise RuntimeError("x")
+        async def fail_live(*args): raise RuntimeError("x")
+        with patch.object(m.CACHE, "configured", return_value=True), \
+             patch.object(m.CACHE, "search", side_effect=fail_cache), \
+             patch.object(m, "tavily_search", side_effect=fail_live), \
+             patch.object(m, "serpapi_search", side_effect=fail_live), \
+             patch.dict(os.environ, {"TAVILY_API_KEY":"t", "SERPAPI_API_KEY":"s"}, clear=False), \
+             patch.object(m, "SOCIAL_DISCOVERY_ENABLED", False):
+            results, states = await m.aggregate_search("atlas", 16, self.router)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].provider, "duckduckgo")
+
+    async def test_108_duplicate_cross_provider_merges(self):
+        same_cache = [ev("cache", "https://same.test/a?utm_source=x")]
+        same_tavily = [ev("tavily", "https://same.test/a", snippet="longer atlas research")]
+        results, _ = await self._run(cache=same_cache, tavily=same_tavily, serp=[] , ddg_text="")
+        self.assertEqual(len(results), 1)
+        self.assertEqual(set(results[0].providers), {"cache", "tavily"})
+
+    async def test_109_social_queries_expand_live_calls(self):
+        tavily_calls=[]; serp_calls=[]
+        async def ft(planned, max_results, news): tavily_calls.append(planned.query); return []
+        async def fs(planned, max_results, news): serp_calls.append(planned.query); return []
+        with patch.object(m.CACHE, "configured", return_value=False), \
+             patch.object(m, "tavily_search", side_effect=ft), \
+             patch.object(m, "serpapi_search", side_effect=fs), \
+             patch.dict(os.environ, {"TAVILY_API_KEY":"t", "SERPAPI_API_KEY":"s"}, clear=False), \
+             patch.object(m, "SOCIAL_DISCOVERY_ENABLED", True):
+            await m.aggregate_search("atlas", 16, self.router)
+        self.assertEqual(len(tavily_calls), 4)
+        self.assertEqual(len(serp_calls), 4)
+        self.assertTrue(any(q.startswith("site:facebook.com ") for q in tavily_calls))
+        self.assertTrue(any(q.startswith("site:tiktok.com ") for q in tavily_calls))
+        self.assertTrue(any(q.startswith("site:youtube.com ") for q in tavily_calls))
+
+    async def test_110_ddg_only_base_query(self):
+        await self._run(social=True)
+        ddg_calls = [x for x in self.router.calls if x[0] == "search"]
+        self.assertEqual(len(ddg_calls), 1)
+        self.assertEqual(ddg_calls[0][1]["query"], "atlas")
+
+    async def test_111_result_limit(self):
+        many = [ev("tavily", f"https://d{i}.test/a") for i in range(30)]
+        results, _ = await self._run(cache=[], tavily=many, serp=[], ddg_text="")
+        self.assertLessEqual(len(results), 16)
+
+    async def test_112_domain_diversity(self):
+        many = [ev("tavily", f"https://same.test/{i}") for i in range(20)]
+        results, _ = await self._run(cache=[], tavily=many, serp=[], ddg_text="")
+        self.assertLessEqual(len(results), m.MAX_PER_DOMAIN)
+
+    async def test_113_missing_api_keys_disable_live_api_sources(self):
+        with patch.object(m.CACHE, "configured", return_value=False), \
+             patch.dict(os.environ, {"TAVILY_API_KEY":"", "SERPAPI_API_KEY":""}, clear=False), \
+             patch.object(m, "SOCIAL_DISCOVERY_ENABLED", False):
+            results, states = await m.aggregate_search("atlas", 16, self.router)
+        self.assertFalse(states["tavily"].enabled)
+        self.assertFalse(states["serpapi"].enabled)
+        self.assertEqual(len(results), 1)
+
+    async def test_114_empty_sources_do_not_count_failure(self):
+        results, states = await self._run(cache=[], tavily=[], serp=[], ddg_text="")
+        self.assertEqual(results, [])
+        self.assertEqual(states["cache"].failed, 0)
+        self.assertEqual(states["tavily"].failed, 0)
+        self.assertEqual(states["serpapi"].failed, 0)
+        self.assertEqual(states["duckduckgo"].failed, 0)
 
 
-def tokens(value: str, *, remove_generic: bool = True) -> List[str]:
-    out: List[str] = []
-    seen = set()
-    for tok in normalize_text(value).split():
-        if len(tok) <= 1 and tok != "ai":
-            continue
-        if remove_generic and tok in GENERIC_TOKENS:
-            continue
-        if tok not in seen:
-            seen.add(tok)
-            out.append(tok)
-    return out
+class InterceptIntegrationSimulation(unittest.IsolatedAsyncioTestCase):
+    async def test_201_non_tool_call_passthrough(self):
+        router = FakeRouter()
+        self.assertIsNone(await m.maybe_intercept_tool_call(json.dumps({"method":"tools/list","id":1}), router))
+
+    async def test_202_unknown_tool_passthrough(self):
+        router = FakeRouter()
+        msg = {"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"other","arguments":{}}}
+        self.assertIsNone(await m.maybe_intercept_tool_call(json.dumps(msg), router))
+
+    async def test_203_restricted_search_intercepted(self):
+        router = FakeRouter()
+        msg = {"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"search","arguments":{"query":"casino gambling"}}}
+        out = json.loads(await m.maybe_intercept_tool_call(json.dumps(msg), router))
+        self.assertEqual(out["id"], 9)
+        self.assertFalse(out["result"]["isError"])
+        self.assertEqual(router.calls, [])
+
+    async def test_204_search_original_id_preserved(self):
+        router = FakeRouter("[DDG](https://ddg.test/a) atlas")
+        async def fake_aggregate(q, n, r):
+            states = {x:m.ProviderState(x, x=="duckduckgo", ok=1 if x=="duckduckgo" else 0, rows=1 if x=="duckduckgo" else 0) for x in ("cache","tavily","serpapi","duckduckgo")}
+            return [ev("duckduckgo", "https://ddg.test/a")], states
+        msg = {"jsonrpc":"2.0","id":"abc","method":"tools/call","params":{"name":"search","arguments":{"query":"atlas"}}}
+        with patch.object(m, "aggregate_search", side_effect=fake_aggregate):
+            out = json.loads(await m.maybe_intercept_tool_call(json.dumps(msg), router))
+        self.assertEqual(out["id"], "abc")
+        self.assertIn("ATLAS MULTI-SOURCE SEARCH", out["result"]["content"][0]["text"])
+
+    async def test_205_fetch_live_wins_over_cache(self):
+        router = FakeRouter(fetch_text="ddg")
+        msg = {"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"fetch_content","arguments":{"url":"https://example.com/a"}}}
+        with patch.object(m.CACHE, "configured", return_value=True), \
+             patch.object(m.CACHE, "fetch_exact", new=AsyncMock(return_value="CACHE")), \
+             patch.object(m, "tavily_extract", new=AsyncMock(return_value="LIVE")), \
+             patch.dict(os.environ, {"TAVILY_API_KEY":"t"}, clear=False):
+            out = json.loads(await m.maybe_intercept_tool_call(json.dumps(msg), router))
+        self.assertEqual(out["result"]["content"][0]["text"], "LIVE")
+        self.assertEqual(router.calls, [])
+
+    async def test_206_fetch_cache_fallback(self):
+        router = FakeRouter(fetch_text="ddg")
+        msg = {"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"fetch_content","arguments":{"url":"https://example.com/a"}}}
+        with patch.object(m.CACHE, "configured", return_value=True), \
+             patch.object(m.CACHE, "fetch_exact", new=AsyncMock(return_value="CACHE")), \
+             patch.object(m, "tavily_extract", new=AsyncMock(return_value=None)), \
+             patch.dict(os.environ, {"TAVILY_API_KEY":"t"}, clear=False):
+            out = json.loads(await m.maybe_intercept_tool_call(json.dumps(msg), router))
+        self.assertEqual(out["result"]["content"][0]["text"], "CACHE")
+        self.assertEqual(router.calls, [])
+
+    async def test_207_fetch_ddg_final_fallback(self):
+        router = FakeRouter(fetch_text="DDG FETCH CONTENT")
+        msg = {"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"fetch_content","arguments":{"url":"https://example.com/a"}}}
+        with patch.object(m.CACHE, "configured", return_value=False), \
+             patch.dict(os.environ, {"TAVILY_API_KEY":""}, clear=False):
+            out = json.loads(await m.maybe_intercept_tool_call(json.dumps(msg), router))
+        self.assertEqual(out["result"]["content"][0]["text"], "DDG FETCH CONTENT")
+        self.assertEqual(router.calls[0][0], "fetch_content")
+
+    async def test_208_fetch_private_url_passthrough(self):
+        router = FakeRouter()
+        msg = {"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"fetch_content","arguments":{"url":"http://127.0.0.1/a"}}}
+        self.assertIsNone(await m.maybe_intercept_tool_call(json.dumps(msg), router))
+
+    async def test_209_fetch_exceptions_fall_to_ddg(self):
+        router = FakeRouter(fetch_text="DDG")
+        msg = {"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"fetch_content","arguments":{"url":"https://example.com/a"}}}
+        with patch.object(m.CACHE, "configured", return_value=True), \
+             patch.object(m.CACHE, "fetch_exact", new=AsyncMock(side_effect=RuntimeError("cache fail"))), \
+             patch.object(m, "tavily_extract", new=AsyncMock(side_effect=RuntimeError("live fail"))), \
+             patch.dict(os.environ, {"TAVILY_API_KEY":"t"}, clear=False):
+            out = json.loads(await m.maybe_intercept_tool_call(json.dumps(msg), router))
+        self.assertEqual(out["result"]["content"][0]["text"], "DDG")
+
+    async def test_210_fetch_ddg_failure_returns_message_not_crash(self):
+        class BadRouter:
+            async def call_tool(self, *args, **kwargs): raise RuntimeError("ddg fail")
+        msg = {"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"fetch_content","arguments":{"url":"https://example.com/a"}}}
+        with patch.object(m.CACHE, "configured", return_value=False), patch.dict(os.environ, {"TAVILY_API_KEY":""}, clear=False):
+            out = json.loads(await m.maybe_intercept_tool_call(json.dumps(msg), BadRouter()))
+        self.assertIn("Unable to fetch", out["result"]["content"][0]["text"])
 
 
-def has_news_intent(query: str) -> bool:
-    raw = set(normalize_text(query).split())
-    return bool(raw & NEWS_HINTS)
-
-
-def query_is_restricted(query: str) -> bool:
-    normalized = normalize_text(query)
-    return any(pattern.search(normalized) for pattern in RESTRICTED_PATTERNS)
-
-
-def parse_iso(value: str) -> Optional[datetime]:
-    value = (value or "").strip()
-    if not value:
-        return None
-    if value.endswith("Z"):
-        value = value[:-1] + "+00:00"
-    try:
-        dt = datetime.fromisoformat(value)
-    except ValueError:
-        return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
-
-
-def cache_bypass_enabled() -> bool:
-    raw = os.environ.get("ATLAS_CACHE_BYPASS", "").strip().lower()
-    if raw in {"1", "true", "yes", "on"}:
-        return True
-    return os.environ.get("GITHUB_ACTIONS", "").strip().lower() == "true"
-
-
-def derive_cache_url() -> str:
-    explicit = os.environ.get("ATLAS_RESEARCH_CACHE_URL", "").strip()
-    if explicit:
-        return explicit
-    legacy = os.environ.get("RESEARCH_CACHE_URL", "").strip()
-    if legacy:
-        return legacy
-    repo = (
-        os.environ.get("ATLAS_GITHUB_REPOSITORY", "").strip()
-        or os.environ.get("GITHUB_REPOSITORY", "").strip()
-    )
-    if "/" not in repo:
-        return ""
-    owner, name = repo.split("/", 1)
-    return f"https://{owner}.github.io/{name}/atlas_research.json"
-
-
-def canonical_url_for_cache(value: str) -> str:
-    raw = (value or "").strip()
-    if not raw:
-        return ""
-    try:
-        parts = urlsplit(raw)
-    except Exception:
-        return raw.rstrip("/")
-    if not parts.scheme or not parts.netloc:
-        return raw.rstrip("/")
-    path = parts.path or "/"
-    if path != "/":
-        path = path.rstrip("/")
-    return urlunsplit((parts.scheme.lower(), parts.netloc.lower(), path, parts.query, ""))
-
-
-def is_public_http_url(value: str) -> bool:
-    try:
-        parts = urlsplit((value or "").strip())
-    except Exception:
-        return False
-    if parts.scheme.lower() not in {"http", "https"} or not parts.hostname:
-        return False
-    host = parts.hostname.lower().rstrip(".")
-    if host in {"localhost", "localhost.localdomain"} or host.endswith(".local"):
-        return False
-    try:
-        ip = ipaddress.ip_address(host)
-    except ValueError:
-        return True
-    return not (
-        ip.is_private
-        or ip.is_loopback
-        or ip.is_link_local
-        or ip.is_multicast
-        or ip.is_reserved
-        or ip.is_unspecified
-    )
-
-
-def upstream_command() -> List[str]:
-    raw_json = os.environ.get("ATLAS_DDG_CHILD_ARGS_JSON", "").strip()
-    command = os.environ.get("ATLAS_DDG_CHILD_COMMAND", "uvx").strip() or "uvx"
-    if raw_json:
-        try:
-            args = json.loads(raw_json)
-            if not isinstance(args, list) or not all(isinstance(x, str) for x in args):
-                raise ValueError("must be a JSON array of strings")
-            return [command, *args]
-        except Exception as exc:
-            raise RuntimeError(f"ATLAS_DDG_CHILD_ARGS_JSON invalid: {exc}") from exc
-    return [
-        command,
-        "--with",
-        "duckduckgo-mcp-server[browser]",
-        "duckduckgo-mcp-server",
-        "--fetch-backend",
-        "auto",
-    ]
-
-
-@dataclass
-class CacheSnapshot:
-    payload: Optional[Dict[str, Any]] = None
-    last_attempt_monotonic: float = 0.0
-    source_url: str = ""
-    last_error: str = ""
-    hits_search: int = 0
-    hits_fetch: int = 0
-    misses: int = 0
-
-
-class ResearchCache:
-    def __init__(self) -> None:
-        self.state = CacheSnapshot(source_url=derive_cache_url())
-        self._lock = asyncio.Lock()
-
-    def configured(self) -> bool:
-        return bool(self.state.source_url) and not cache_bypass_enabled()
-
-    async def refresh(self, *, force: bool = False) -> Optional[Dict[str, Any]]:
-        if not self.configured():
-            return None
+class RouterSimulation(unittest.IsolatedAsyncioTestCase):
+    async def test_301_fail_waiters(self):
+        proc = SimpleNamespace(stdin=None)
+        r = m.UpstreamRouter(proc)
         loop = asyncio.get_running_loop()
-        now = loop.time()
-        if (
-            not force
-            and self.state.last_attempt_monotonic > 0
-            and now - self.state.last_attempt_monotonic < CACHE_REFRESH_SECONDS
-        ):
-            return self.state.payload
-        async with self._lock:
-            now = loop.time()
-            if (
-                not force
-                and self.state.last_attempt_monotonic > 0
-                and now - self.state.last_attempt_monotonic < CACHE_REFRESH_SECONDS
-            ):
-                return self.state.payload
-            self.state.last_attempt_monotonic = now
-            timeout = ClientTimeout(total=CACHE_TIMEOUT_SECONDS)
-            try:
-                async with ClientSession(timeout=timeout) as session:
-                    async with session.get(
-                        self.state.source_url,
-                        headers={
-                            "User-Agent": f"ATLAS-Multi-Proxy/{VERSION}",
-                            "Accept": "application/json",
-                            "Cache-Control": "no-cache",
-                        },
-                        allow_redirects=True,
-                    ) as response:
-                        if response.status != 200:
-                            raise RuntimeError(f"HTTP {response.status}")
-                        payload = await response.json(content_type=None)
-                if not isinstance(payload, dict):
-                    raise RuntimeError("cache root is not a JSON object")
-                if not isinstance(payload.get("items", []), list):
-                    raise RuntimeError("cache items is not a list")
-                self.state.payload = payload
-                self.state.last_error = ""
-                LOGGER.info(
-                    "[CACHE] REFRESH PASS | status=%s | items=%s | generated_at=%s",
-                    payload.get("status"),
-                    len(payload.get("items", []) or []),
-                    payload.get("generated_at", ""),
-                )
-                return payload
-            except Exception as exc:
-                self.state.last_error = str(exc)
-                LOGGER.warning(
-                    "[CACHE] REFRESH FAIL | %s | fallback=WEB | retry_after=%ss",
-                    exc,
-                    CACHE_REFRESH_SECONDS,
-                )
-                return self.state.payload
+        fut = loop.create_future()
+        r._waiters["x"] = fut
+        r.fail_waiters(RuntimeError("boom"))
+        with self.assertRaises(RuntimeError):
+            await fut
 
-    def fresh(self, payload: Optional[Dict[str, Any]]) -> bool:
-        if not payload:
-            return False
-        generated = parse_iso(str(payload.get("generated_at", "")))
-        if generated is None:
-            return False
-        age = (utc_now() - generated).total_seconds()
-        return -300 <= age <= CACHE_MAX_AGE_SECONDS
+    async def test_302_internal_prefix(self):
+        self.assertTrue(m.UpstreamRouter.INTERNAL_PREFIX.startswith("__atlas_internal"))
 
-    @staticmethod
-    def _item_blob(item: Dict[str, Any]) -> str:
-        urls = item.get("urls", []) or []
-        if not isinstance(urls, list):
-            urls = []
-        return " ".join(
-            [
-                str(item.get("topic", "")),
-                str(item.get("search_text", "")),
-                str(item.get("fetched_text", "")),
-                str(item.get("fetched_url", "")),
-                " ".join(str(x) for x in urls),
-            ]
-        )
+    async def test_303_route_internal_not_forwarded(self):
+        proc = SimpleNamespace(stdin=None)
+        r = m.UpstreamRouter(proc)
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+        rid = "__atlas_internal__1"
+        r._waiters[rid] = fut
+        raw = (json.dumps({"jsonrpc":"2.0","id":rid,"result":{"content":[]}})+"\n").encode()
+        with patch.object(m, "write_stdout", new=AsyncMock()) as writer:
+            await r.route_child_line(raw)
+        self.assertTrue(fut.done())
+        writer.assert_not_called()
 
-    def search_items(
-        self, payload: Dict[str, Any], query: str, max_results: int
-    ) -> List[Tuple[int, Dict[str, Any]]]:
-        q_tokens = set(tokens(query))
-        news_intent = has_news_intent(query)
-        ranked: List[Tuple[int, str, Dict[str, Any]]] = []
-        for raw in payload.get("items", []) or []:
-            if not isinstance(raw, dict):
-                continue
-            blob_tokens = set(tokens(self._item_blob(raw), remove_generic=False))
-            topic_tokens = set(tokens(str(raw.get("topic", "")), remove_generic=False))
-            overlap = len(q_tokens & blob_tokens)
-            topic_overlap = len(q_tokens & topic_tokens)
-            score = overlap + (topic_overlap * 2)
-            if not q_tokens and news_intent:
-                score = 1
-            elif score < CACHE_MIN_SCORE:
-                continue
-            discovered = str(raw.get("discovered_at", ""))
-            ranked.append((score, discovered, raw))
-        ranked.sort(key=lambda x: (x[0], x[1]), reverse=True)
-        limit = max(1, min(10, max_results))
-        return [(score, item) for score, _discovered, item in ranked[:limit]]
+    async def test_304_route_external_forwarded(self):
+        proc = SimpleNamespace(stdin=None)
+        r = m.UpstreamRouter(proc)
+        raw = (json.dumps({"jsonrpc":"2.0","id":5,"result":{"content":[]}})+"\n").encode()
+        with patch.object(m, "write_stdout", new=AsyncMock()) as writer:
+            await r.route_child_line(raw)
+        writer.assert_awaited_once()
 
-    async def search_hit(self, query: str, max_results: int) -> Optional[str]:
-        payload = await self.refresh()
-        if not self.fresh(payload):
-            self.state.misses += 1
-            if payload:
-                LOGGER.info("[CACHE] SEARCH MISS | stale cache | query=%r", query[:120])
-            return None
-        assert payload is not None
-        ranked = self.search_items(payload, query, max_results)
-        if not ranked:
-            self.state.misses += 1
-            LOGGER.info("[CACHE] SEARCH MISS | no relevant item | query=%r", query[:120])
-            return None
-        parts = [
-            "ATLAS CACHE HIT — public GitHub Pages research cache",
-            f"Cache generated_at: {payload.get('generated_at', '')}",
-            f"Query: {query}",
-            "",
-        ]
-        for idx, (score, item) in enumerate(ranked, 1):
-            urls = item.get("urls", []) or []
-            if not isinstance(urls, list):
-                urls = []
-            parts.extend(
-                [
-                    f"[{idx}] Topic: {item.get('topic', '')}",
-                    f"Relevance score: {score}",
-                    f"Discovered: {item.get('discovered_at', '')}",
-                    "URLs:",
-                    *(f"- {url}" for url in urls[:5]),
-                ]
-            )
-            search_text = str(item.get("search_text", "")).strip()
-            fetched_text = str(item.get("fetched_text", "")).strip()
-            fetched_url = str(item.get("fetched_url", "")).strip()
-            if search_text:
-                parts.append("Search result text:\n" + search_text[:2600])
-            if fetched_text:
-                parts.append(
-                    "Cached fetched content"
-                    + (f" ({fetched_url})" if fetched_url else "")
-                    + ":\n"
-                    + fetched_text[:2200]
-                )
-            parts.append("")
-        text = "\n".join(parts).strip()
-        self.state.hits_search += 1
-        LOGGER.info(
-            "[CACHE] SEARCH HIT | query=%r | results=%s | hit_count=%s",
-            query[:120], len(ranked), self.state.hits_search,
-        )
-        return text[:CACHE_MAX_SEARCH_CHARS]
-
-    async def fetch_hit(self, url: str, start_index: int, max_length: int) -> Optional[str]:
-        payload = await self.refresh()
-        if not self.fresh(payload):
-            self.state.misses += 1
-            return None
-        assert payload is not None
-        target = (url or "").strip()
-        target_key = canonical_url_for_cache(target)
-        if not target_key:
-            return None
-        for raw in payload.get("items", []) or []:
-            if not isinstance(raw, dict):
-                continue
-            fetched_url = str(raw.get("fetched_url", "")).strip()
-            if not fetched_url:
-                continue
-            if canonical_url_for_cache(fetched_url) != target_key:
-                continue
-            text = str(raw.get("fetched_text", "")).strip()
-            if not text:
-                continue
-            start = max(0, start_index)
-            length = max(1, min(CACHE_MAX_FETCH_CHARS, max_length))
-            sliced = text[start:start + length]
-            if not sliced:
-                return None
-            self.state.hits_fetch += 1
-            LOGGER.info(
-                "[CACHE] FETCH HIT | url=%s | chars=%s | hit_count=%s",
-                target[:240], len(sliced), self.state.hits_fetch,
-            )
-            return (
-                "ATLAS CACHE HIT — cached fetched content\n"
-                f"URL: {fetched_url}\n"
-                f"Cache generated_at: {payload.get('generated_at', '')}\n\n"
-                f"{sliced}"
-            )
-        self.state.misses += 1
-        LOGGER.info("[CACHE] FETCH MISS | url=%s", target[:240])
-        return None
-
-
-CACHE = ResearchCache()
-STDOUT_LOCK: Optional[asyncio.Lock] = None
-
-
-def mcp_text_response(request_id: Any, text: str, *, is_error: bool = False) -> str:
-    payload = {
-        "jsonrpc": "2.0",
-        "id": request_id,
-        "result": {
-            "content": [{"type": "text", "text": text}],
-            "isError": bool(is_error),
-        },
-    }
-    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-
-
-async def write_stdout(line: str) -> None:
-    global STDOUT_LOCK
-    if STDOUT_LOCK is None:
-        STDOUT_LOCK = asyncio.Lock()
-    async with STDOUT_LOCK:
-        sys.stdout.write(line.rstrip("\r\n") + "\n")
-        sys.stdout.flush()
-
-
-async def tavily_search(query: str, max_results: int) -> Optional[str]:
-    api_key = os.environ.get("TAVILY_API_KEY", "").strip()
-    if not api_key:
-        return None
-    limit = max(1, min(TAVILY_MAX_RESULTS, max_results))
-    body: Dict[str, Any] = {
-        "query": query,
-        "search_depth": "basic",
-        "topic": "news" if has_news_intent(query) else "general",
-        "max_results": limit,
-        "include_answer": False,
-        "include_raw_content": False,
-        "include_images": False,
-    }
-    timeout = ClientTimeout(total=WEB_TIMEOUT_SECONDS)
-    try:
-        async with ClientSession(timeout=timeout) as session:
-            async with session.post(
-                TAVILY_SEARCH_URL,
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                    "User-Agent": f"ATLAS-Multi-Proxy/{VERSION}",
-                },
-                json=body,
-            ) as response:
-                raw_text = await response.text()
-                if response.status != 200:
-                    raise RuntimeError(f"HTTP {response.status}: {raw_text[:300]}")
-                data = json.loads(raw_text)
-        results = data.get("results", []) if isinstance(data, dict) else []
-        if not isinstance(results, list) or not results:
-            LOGGER.warning("[TAVILY] SEARCH EMPTY | query=%r", query[:120])
-            return None
-        parts = ["ATLAS LIVE SEARCH — Tavily", f"Query: {query}", ""]
-        count = 0
-        for item in results[:limit]:
-            if not isinstance(item, dict):
-                continue
-            url = str(item.get("url", "")).strip()
-            title = str(item.get("title", "")).strip()
-            content = str(item.get("content", "")).strip()
-            published = str(item.get("published_date", "")).strip()
-            score = item.get("score")
-            if not url and not content:
-                continue
-            count += 1
-            parts.append(f"[{count}] {title or 'Result'}")
-            if url:
-                parts.append(f"URL: {url}")
-            if published:
-                parts.append(f"Published: {published}")
-            if score is not None:
-                parts.append(f"Score: {score}")
-            if content:
-                parts.append("Snippet: " + content[:1800])
-            parts.append("")
-        if count == 0:
-            return None
-        text = "\n".join(parts).strip()
-        LOGGER.info("[TAVILY] SEARCH PASS | query=%r | results=%s", query[:120], count)
-        return text[:CACHE_MAX_SEARCH_CHARS]
-    except Exception as exc:
-        LOGGER.warning("[TAVILY] SEARCH FAIL | query=%r | %s", query[:120], exc)
-        return None
-
-
-async def serpapi_search(query: str, max_results: int) -> Optional[str]:
-    api_key = os.environ.get("SERPAPI_API_KEY", "").strip()
-    if not api_key:
-        return None
-    limit = max(1, min(SERPAPI_MAX_RESULTS, max_results))
-    params: Dict[str, str] = {
-        "engine": "google",
-        "q": query,
-        "api_key": api_key,
-        "num": str(limit),
-        "hl": "vi",
-        "gl": "vn",
-        "safe": "active",
-        "output": "json",
-    }
-    if has_news_intent(query):
-        params["tbm"] = "nws"
-    timeout = ClientTimeout(total=WEB_TIMEOUT_SECONDS)
-    try:
-        async with ClientSession(timeout=timeout) as session:
-            async with session.get(
-                SERPAPI_SEARCH_URL,
-                params=params,
-                headers={"User-Agent": f"ATLAS-Multi-Proxy/{VERSION}"},
-            ) as response:
-                raw_text = await response.text()
-                if response.status != 200:
-                    raise RuntimeError(f"HTTP {response.status}: {raw_text[:300]}")
-                data = json.loads(raw_text)
-        if not isinstance(data, dict):
-            return None
-        if data.get("error"):
-            raise RuntimeError(str(data.get("error")))
-        results = data.get("news_results") if has_news_intent(query) else data.get("organic_results")
-        if not isinstance(results, list) or not results:
-            # Google sometimes gives only an answer box/knowledge graph.
-            results = data.get("organic_results", [])
-        parts = ["ATLAS LIVE SEARCH — SerpApi / Google", f"Query: {query}", ""]
-        count = 0
-        if isinstance(results, list):
-            for item in results[:limit]:
-                if not isinstance(item, dict):
-                    continue
-                title = str(item.get("title", "")).strip()
-                url = str(item.get("link", "")).strip()
-                snippet = str(item.get("snippet", "")).strip()
-                source = item.get("source")
-                date = str(item.get("date", "")).strip()
-                if isinstance(source, dict):
-                    source = source.get("name") or source.get("title") or ""
-                source = str(source or "").strip()
-                if not url and not snippet:
-                    continue
-                count += 1
-                parts.append(f"[{count}] {title or 'Result'}")
-                if source:
-                    parts.append(f"Source: {source}")
-                if date:
-                    parts.append(f"Date: {date}")
-                if url:
-                    parts.append(f"URL: {url}")
-                if snippet:
-                    parts.append("Snippet: " + snippet[:1800])
-                parts.append("")
-        if count == 0:
-            answer_box = data.get("answer_box")
-            if isinstance(answer_box, dict):
-                text_bits = []
-                for key in ("answer", "result", "snippet", "title"):
-                    value = answer_box.get(key)
-                    if value:
-                        text_bits.append(str(value))
-                link = answer_box.get("link")
-                if text_bits:
-                    count = 1
-                    parts.append("[1] Google answer")
-                    if link:
-                        parts.append(f"URL: {link}")
-                    parts.append("Snippet: " + " — ".join(text_bits)[:2500])
-        if count == 0:
-            LOGGER.warning("[SERPAPI] SEARCH EMPTY | query=%r", query[:120])
-            return None
-        text = "\n".join(parts).strip()
-        LOGGER.info("[SERPAPI] SEARCH PASS | query=%r | results=%s", query[:120], count)
-        return text[:CACHE_MAX_SEARCH_CHARS]
-    except Exception as exc:
-        LOGGER.warning("[SERPAPI] SEARCH FAIL | query=%r | %s", query[:120], exc)
-        return None
-
-
-async def tavily_extract(url: str, start_index: int, max_length: int) -> Optional[str]:
-    api_key = os.environ.get("TAVILY_API_KEY", "").strip()
-    if not api_key or not is_public_http_url(url):
-        return None
-    body = {"urls": [url], "extract_depth": "basic"}
-    timeout = ClientTimeout(total=WEB_TIMEOUT_SECONDS)
-    try:
-        async with ClientSession(timeout=timeout) as session:
-            async with session.post(
-                TAVILY_EXTRACT_URL,
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                    "User-Agent": f"ATLAS-Multi-Proxy/{VERSION}",
-                },
-                json=body,
-            ) as response:
-                raw_text = await response.text()
-                if response.status != 200:
-                    raise RuntimeError(f"HTTP {response.status}: {raw_text[:300]}")
-                data = json.loads(raw_text)
-        results = data.get("results", []) if isinstance(data, dict) else []
-        if not isinstance(results, list) or not results:
-            LOGGER.warning("[TAVILY] EXTRACT EMPTY | url=%s", url[:240])
-            return None
-        first = results[0] if isinstance(results[0], dict) else {}
-        content = str(first.get("raw_content", "")).strip()
-        if not content:
-            return None
-        start = max(0, start_index)
-        length = max(1, min(CACHE_MAX_FETCH_CHARS, max_length))
-        sliced = content[start:start + length]
-        if not sliced:
-            return None
-        LOGGER.info("[TAVILY] EXTRACT PASS | url=%s | chars=%s", url[:240], len(sliced))
-        return f"ATLAS LIVE FETCH — Tavily Extract\nURL: {url}\n\n{sliced}"
-    except Exception as exc:
-        LOGGER.warning("[TAVILY] EXTRACT FAIL | url=%s | %s", url[:240], exc)
-        return None
-
-
-async def maybe_intercept_tool_call(message: str) -> Optional[str]:
-    try:
-        payload = json.loads(message)
-    except Exception:
-        return None
-    if not isinstance(payload, dict) or payload.get("method") != "tools/call":
-        return None
-    request_id = payload.get("id")
-    if request_id is None:
-        return None
-    params = payload.get("params")
-    if not isinstance(params, dict):
-        return None
-    name = str(params.get("name", ""))
-    arguments = params.get("arguments") or {}
-    if not isinstance(arguments, dict):
-        arguments = {}
-
-    if name == "search":
-        query = str(arguments.get("query", "")).strip()
-        if not query:
-            return None
-        if query_is_restricted(query):
-            LOGGER.warning("[SAFE] SEARCH BLOCKED | query=%r", query[:120])
-            return mcp_text_response(
-                request_id,
-                "Web search blocked for this request. I can still help with safe, factual, age-appropriate information.",
-                is_error=False,
-            )
-        try:
-            max_results = int(arguments.get("max_results", 10))
-        except (TypeError, ValueError):
-            max_results = 10
-
-        if CACHE.configured():
-            hit = await CACHE.search_hit(query, max_results)
-            if hit:
-                LOGGER.info("[WEB ROUTE] tool=search | source=CACHE")
-                return mcp_text_response(request_id, hit)
-
-        live = await tavily_search(query, max_results)
-        if live:
-            LOGGER.info("[WEB ROUTE] tool=search | source=TAVILY")
-            return mcp_text_response(request_id, live)
-
-        live = await serpapi_search(query, max_results)
-        if live:
-            LOGGER.info("[WEB ROUTE] tool=search | source=SERPAPI")
-            return mcp_text_response(request_id, live)
-
-        LOGGER.info("[WEB ROUTE] tool=search | source=DUCKDUCKGO")
-        return None
-
-    if name == "fetch_content":
-        url = str(arguments.get("url", "")).strip()
-        if not url:
-            return None
-        try:
-            start_index = int(arguments.get("start_index", 0))
-        except (TypeError, ValueError):
-            start_index = 0
-        try:
-            max_length = int(arguments.get("max_length", 8000))
-        except (TypeError, ValueError):
-            max_length = 8000
-
-        if CACHE.configured():
-            hit = await CACHE.fetch_hit(url, start_index, max_length)
-            if hit:
-                LOGGER.info("[WEB ROUTE] tool=fetch_content | source=CACHE")
-                return mcp_text_response(request_id, hit)
-
-        live = await tavily_extract(url, start_index, max_length)
-        if live:
-            LOGGER.info("[WEB ROUTE] tool=fetch_content | source=TAVILY")
-            return mcp_text_response(request_id, live)
-
-        LOGGER.info("[WEB ROUTE] tool=fetch_content | source=DUCKDUCKGO")
-        return None
-
-    return None
-
-
-async def warm_cache_loop() -> None:
-    if cache_bypass_enabled():
-        LOGGER.info("[CACHE] BYPASS | environment requests LIVE-only mode")
-        return
-    if not CACHE.configured():
-        LOGGER.warning(
-            "[CACHE] DISABLED | set ATLAS_RESEARCH_CACHE_URL (or RESEARCH_CACHE_URL) "
-            "or ATLAS_GITHUB_REPOSITORY"
-        )
-        return
-    LOGGER.info("[CACHE] ENABLED | source=%s", CACHE.state.source_url)
-    while True:
-        try:
-            await CACHE.refresh(force=True)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            LOGGER.warning("[CACHE] warm loop error: %s", exc)
-        await asyncio.sleep(CACHE_REFRESH_SECONDS)
-
-
-async def parent_to_child(process: asyncio.subprocess.Process) -> None:
-    if process.stdin is None:
-        raise RuntimeError("upstream MCP stdin unavailable")
-    while True:
-        line = await asyncio.to_thread(sys.stdin.readline)
-        if line == "":
-            try:
-                process.stdin.close()
-            except Exception:
-                pass
-            return
-        message = line.rstrip("\r\n")
-        if not message:
-            continue
-        intercepted = await maybe_intercept_tool_call(message)
-        if intercepted is not None:
-            await write_stdout(intercepted)
-            continue
-        process.stdin.write((message + "\n").encode("utf-8"))
-        await process.stdin.drain()
-
-
-async def child_to_parent(process: asyncio.subprocess.Process) -> None:
-    if process.stdout is None:
-        raise RuntimeError("upstream MCP stdout unavailable")
-    while True:
-        raw = await process.stdout.readline()
-        if not raw:
-            return
-        await write_stdout(raw.decode("utf-8", errors="replace"))
-
-
-async def child_stderr(process: asyncio.subprocess.Process) -> None:
-    if process.stderr is None:
-        return
-    while True:
-        raw = await process.stderr.readline()
-        if not raw:
-            return
-        text = raw.decode("utf-8", errors="replace").rstrip("\r\n")
-        print(f"[UPSTREAM_DDG] {text}", file=sys.stderr, flush=True)
-
-
-async def main() -> int:
-    command = upstream_command()
-    LOGGER.info("ATLAS Multi-Source Proxy v%s starting", VERSION)
-    LOGGER.info(
-        "Sources | cache=%s | tavily=%s | serpapi=%s | ddg=enabled",
-        "enabled" if CACHE.configured() else "disabled",
-        "enabled" if os.environ.get("TAVILY_API_KEY", "").strip() else "disabled",
-        "enabled" if os.environ.get("SERPAPI_API_KEY", "").strip() else "disabled",
-    )
-    LOGGER.info("Upstream MCP: %s", " ".join(command))
-
-    child_env = os.environ.copy()
-    process = await asyncio.create_subprocess_exec(
-        *command,
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        env=child_env,
-    )
-    cache_task = asyncio.create_task(warm_cache_loop(), name="atlas-cache-warm")
-    p2c = asyncio.create_task(parent_to_child(process), name="parent-to-ddg")
-    c2p = asyncio.create_task(child_to_parent(process), name="ddg-to-parent")
-    cerr = asyncio.create_task(child_stderr(process), name="ddg-stderr")
-    wait = asyncio.create_task(process.wait(), name="ddg-exit")
-
-    done, pending = await asyncio.wait({p2c, c2p, wait}, return_when=asyncio.FIRST_COMPLETED)
-    exit_code = process.returncode
-    if wait in done:
-        exit_code = wait.result()
-        LOGGER.warning("Upstream MCP exited with code %s", exit_code)
-
-    for task in pending:
-        task.cancel()
-    if not cache_task.done():
-        cache_task.cancel()
-    if not cerr.done():
-        cerr.cancel()
-
-    await asyncio.gather(*pending, cache_task, cerr, return_exceptions=True)
-    if process.returncode is None:
-        process.terminate()
-        try:
-            await asyncio.wait_for(process.wait(), timeout=5)
-        except asyncio.TimeoutError:
-            process.kill()
-            await process.wait()
-    return int(exit_code or 0)
+    async def test_305_route_non_json_forwarded(self):
+        proc = SimpleNamespace(stdin=None)
+        r = m.UpstreamRouter(proc)
+        with patch.object(m, "write_stdout", new=AsyncMock()) as writer:
+            await r.route_child_line(b"not-json\n")
+        writer.assert_awaited_once_with("not-json")
 
 
 if __name__ == "__main__":
-    try:
-        raise SystemExit(asyncio.run(main()))
-    except KeyboardInterrupt:
-        raise SystemExit(130)
-    except Exception as exc:
-        LOGGER.exception("ATLAS Multi-Source Proxy FAIL: %s", exc)
-        raise SystemExit(1)
+    unittest.main(verbosity=2)
