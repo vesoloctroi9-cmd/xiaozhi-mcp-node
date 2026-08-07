@@ -1,42 +1,59 @@
 #!/usr/bin/env python3
 """
-ATLAS MULTI-SOURCE MCP PROXY
-Version: 2.0.0
+ATLAS CACHE-FIRST MCP PROXY
+Version: 1.1.0
 
-Route order for search:
-  1) Fresh GitHub Pages research cache
-  2) Tavily Search API (if TAVILY_API_KEY is configured)
-  3) SerpApi Google Search (if SERPAPI_API_KEY is configured)
-  4) Upstream DuckDuckGo MCP server
+Purpose
+-------
+- Sits between Xiaozhi's MCP bridge and duckduckgo-mcp-server.
+- Preserves the same MCP tools exposed by the upstream server.
+- Intercepts only tools/call for:
+    * search        -> use fresh GitHub Pages research cache when relevant.
+    * fetch_content -> use cached fetched_text when URL already exists.
+- Falls back transparently to the live DuckDuckGo MCP server on cache miss,
+  stale cache, disabled cache, or cache/network errors.
+- Does NOT create a keep-alive mechanism and does NOT replace Render's bridge.
 
-Route order for fetch_content:
-  1) Fresh GitHub Pages cached fetched_text
-  2) Tavily Extract API (if TAVILY_API_KEY is configured)
-  3) Upstream DuckDuckGo MCP fetch_content
+Render/GitHub cache configuration
+---------------------------------
+Preferred:
+  ATLAS_RESEARCH_CACHE_URL=https://OWNER.github.io/REPO/atlas_research.json
 
-This proxy preserves the upstream MCP server for initialize/tools/list and for all
-unhandled requests. It does not create a keep-alive mechanism.
+Alternative:
+  ATLAS_GITHUB_REPOSITORY=OWNER/REPO
+
+Optional:
+  ATLAS_CACHE_REFRESH_SECONDS=60
+  ATLAS_CACHE_MAX_AGE_SECONDS=3600
+  ATLAS_CACHE_TIMEOUT_SECONDS=3
+  ATLAS_CACHE_MIN_SCORE=1
+  ATLAS_CACHE_MAX_SEARCH_CHARS=9000
+  ATLAS_CACHE_MAX_FETCH_CHARS=12000
+
+The upstream DuckDuckGo MCP command defaults to:
+  uvx --with duckduckgo-mcp-server[browser] duckduckgo-mcp-server
+      --fetch-backend auto
 """
 
 from __future__ import annotations
 
 import asyncio
-import ipaddress
 import json
 import logging
 import os
 import re
 import sys
 import unicodedata
+from urllib.parse import urlsplit, urlunsplit
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlsplit, urlunsplit
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from aiohttp import ClientSession, ClientTimeout
 
-VERSION = "2.0.0"
-LOGGER = logging.getLogger("ATLAS_MULTI_PROXY")
+
+VERSION = "1.1.0"
+LOGGER = logging.getLogger("ATLAS_CACHE_PROXY")
 logging.basicConfig(
     level=os.environ.get("MCP_LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -60,18 +77,14 @@ CACHE_TIMEOUT_SECONDS = env_int("ATLAS_CACHE_TIMEOUT_SECONDS", 3, 1, 15)
 CACHE_MIN_SCORE = env_int("ATLAS_CACHE_MIN_SCORE", 1, 1, 10)
 CACHE_MAX_SEARCH_CHARS = env_int("ATLAS_CACHE_MAX_SEARCH_CHARS", 9000, 1000, 20000)
 CACHE_MAX_FETCH_CHARS = env_int("ATLAS_CACHE_MAX_FETCH_CHARS", 12000, 1000, 30000)
-WEB_TIMEOUT_SECONDS = env_int("ATLAS_WEB_TIMEOUT_SECONDS", 12, 3, 30)
-TAVILY_MAX_RESULTS = env_int("ATLAS_TAVILY_MAX_RESULTS", 5, 1, 10)
-SERPAPI_MAX_RESULTS = env_int("ATLAS_SERPAPI_MAX_RESULTS", 5, 1, 10)
 
-TAVILY_SEARCH_URL = "https://api.tavily.com/search"
-TAVILY_EXTRACT_URL = "https://api.tavily.com/extract"
-SERPAPI_SEARCH_URL = "https://serpapi.com/search.json"
 
 GENERIC_TOKENS = {
+    # Vietnamese question/news/freshness glue.
     "tin", "tuc", "moi", "nhat", "hom", "nay", "bay", "gio", "doc", "cho",
     "toi", "ve", "la", "gi", "co", "nhung", "cac", "va", "cua", "tren", "the",
     "nao", "cap", "nhat", "thoi", "su", "xem", "tim", "kiem", "noi", "dung",
+    # English equivalents.
     "news", "latest", "today", "read", "search", "find", "about", "what", "the",
     "and", "for", "from", "update", "updates", "current", "recent",
 }
@@ -80,18 +93,13 @@ NEWS_HINTS = {
     "thoi", "su", "update", "updates", "recent", "current",
 }
 
-# Keep web lookup appropriate for a general assistant. Informational/news queries are
-# not blanket-blocked; only clear requests to locate/access restricted material are stopped.
-RESTRICTED_PATTERNS = [
-    re.compile(r"\b(porn|pornography|xxx|sex\s*video|adult\s*video)\b", re.I),
-    re.compile(r"\b(buy|mua|order|dat mua)\b.{0,35}\b(gun|firearm|ammo|ammunition|sung|dao bam|switchblade)\b", re.I),
-    re.compile(r"\b(buy|mua|order|dat mua|how to use|cach dung)\b.{0,35}\b(cocaine|heroin|meth|fentanyl|ma tuy|can sa|marijuana|thc)\b", re.I),
-    re.compile(r"\b(bet|betting|sportsbook|casino|gambling|ca cuoc|danh bac|keo cuoc)\b", re.I),
-]
-
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def utc_now_iso() -> str:
+    return utc_now().isoformat()
 
 
 def normalize_text(value: str) -> str:
@@ -121,11 +129,6 @@ def has_news_intent(query: str) -> bool:
     return bool(raw & NEWS_HINTS)
 
 
-def query_is_restricted(query: str) -> bool:
-    normalized = normalize_text(query)
-    return any(pattern.search(normalized) for pattern in RESTRICTED_PATTERNS)
-
-
 def parse_iso(value: str) -> Optional[datetime]:
     value = (value or "").strip()
     if not value:
@@ -142,6 +145,8 @@ def parse_iso(value: str) -> Optional[datetime]:
 
 
 def cache_bypass_enabled() -> bool:
+    # GitHub Research Worker must always use LIVE DuckDuckGo so the cache does not
+    # feed itself. Explicit ATLAS_CACHE_BYPASS is also supported for diagnostics.
     raw = os.environ.get("ATLAS_CACHE_BYPASS", "").strip().lower()
     if raw in {"1", "true", "yes", "on"}:
         return True
@@ -152,9 +157,15 @@ def derive_cache_url() -> str:
     explicit = os.environ.get("ATLAS_RESEARCH_CACHE_URL", "").strip()
     if explicit:
         return explicit
+
+    # Backward-compatible alias: the current Render environment used this key.
     legacy = os.environ.get("RESEARCH_CACHE_URL", "").strip()
     if legacy:
+        LOGGER.warning(
+            "RESEARCH_CACHE_URL is deprecated; prefer ATLAS_RESEARCH_CACHE_URL"
+        )
         return legacy
+
     repo = (
         os.environ.get("ATLAS_GITHUB_REPOSITORY", "").strip()
         or os.environ.get("GITHUB_REPOSITORY", "").strip()
@@ -166,6 +177,12 @@ def derive_cache_url() -> str:
 
 
 def canonical_url_for_cache(value: str) -> str:
+    """Conservative URL equality for cached fetched_text.
+
+    Keep query parameters because they can select different content. Ignore only
+    fragments, host/scheme case and a trailing slash. Correctness is preferred
+    over a cache hit: a non-identical article must fall back to LIVE fetch.
+    """
     raw = (value or "").strip()
     if not raw:
         return ""
@@ -178,30 +195,8 @@ def canonical_url_for_cache(value: str) -> str:
     path = parts.path or "/"
     if path != "/":
         path = path.rstrip("/")
-    return urlunsplit((parts.scheme.lower(), parts.netloc.lower(), path, parts.query, ""))
-
-
-def is_public_http_url(value: str) -> bool:
-    try:
-        parts = urlsplit((value or "").strip())
-    except Exception:
-        return False
-    if parts.scheme.lower() not in {"http", "https"} or not parts.hostname:
-        return False
-    host = parts.hostname.lower().rstrip(".")
-    if host in {"localhost", "localhost.localdomain"} or host.endswith(".local"):
-        return False
-    try:
-        ip = ipaddress.ip_address(host)
-    except ValueError:
-        return True
-    return not (
-        ip.is_private
-        or ip.is_loopback
-        or ip.is_link_local
-        or ip.is_multicast
-        or ip.is_reserved
-        or ip.is_unspecified
+    return urlunsplit(
+        (parts.scheme.lower(), parts.netloc.lower(), path, parts.query, "")
     )
 
 
@@ -216,6 +211,7 @@ def upstream_command() -> List[str]:
             return [command, *args]
         except Exception as exc:
             raise RuntimeError(f"ATLAS_DDG_CHILD_ARGS_JSON invalid: {exc}") from exc
+
     return [
         command,
         "--with",
@@ -229,6 +225,7 @@ def upstream_command() -> List[str]:
 @dataclass
 class CacheSnapshot:
     payload: Optional[Dict[str, Any]] = None
+    fetched_at_monotonic: float = 0.0
     last_attempt_monotonic: float = 0.0
     source_url: str = ""
     last_error: str = ""
@@ -248,14 +245,19 @@ class ResearchCache:
     async def refresh(self, *, force: bool = False) -> Optional[Dict[str, Any]]:
         if not self.configured():
             return None
+
         loop = asyncio.get_running_loop()
         now = loop.time()
+
+        # Fail-fast throttle applies to both PASS and FAIL attempts. This prevents
+        # every tool call from waiting on the same broken/404 cache URL.
         if (
             not force
             and self.state.last_attempt_monotonic > 0
             and now - self.state.last_attempt_monotonic < CACHE_REFRESH_SECONDS
         ):
             return self.state.payload
+
         async with self._lock:
             now = loop.time()
             if (
@@ -264,6 +266,7 @@ class ResearchCache:
                 and now - self.state.last_attempt_monotonic < CACHE_REFRESH_SECONDS
             ):
                 return self.state.payload
+
             self.state.last_attempt_monotonic = now
             timeout = ClientTimeout(total=CACHE_TIMEOUT_SECONDS)
             try:
@@ -271,7 +274,7 @@ class ResearchCache:
                     async with session.get(
                         self.state.source_url,
                         headers={
-                            "User-Agent": f"ATLAS-Multi-Proxy/{VERSION}",
+                            "User-Agent": f"ATLAS-Cache-Proxy/{VERSION}",
                             "Accept": "application/json",
                             "Cache-Control": "no-cache",
                         },
@@ -280,11 +283,14 @@ class ResearchCache:
                         if response.status != 200:
                             raise RuntimeError(f"HTTP {response.status}")
                         payload = await response.json(content_type=None)
+
                 if not isinstance(payload, dict):
                     raise RuntimeError("cache root is not a JSON object")
                 if not isinstance(payload.get("items", []), list):
                     raise RuntimeError("cache items is not a list")
+
                 self.state.payload = payload
+                self.state.fetched_at_monotonic = loop.time()
                 self.state.last_error = ""
                 LOGGER.info(
                     "[CACHE] REFRESH PASS | status=%s | items=%s | generated_at=%s",
@@ -296,7 +302,7 @@ class ResearchCache:
             except Exception as exc:
                 self.state.last_error = str(exc)
                 LOGGER.warning(
-                    "[CACHE] REFRESH FAIL | %s | fallback=WEB | retry_after=%ss",
+                    "[CACHE] REFRESH FAIL | %s | fallback=LIVE | retry_after=%ss",
                     exc,
                     CACHE_REFRESH_SECONDS,
                 )
@@ -327,25 +333,33 @@ class ResearchCache:
         )
 
     def search_items(
-        self, payload: Dict[str, Any], query: str, max_results: int
+        self,
+        payload: Dict[str, Any],
+        query: str,
+        max_results: int,
     ) -> List[Tuple[int, Dict[str, Any]]]:
         q_tokens = set(tokens(query))
         news_intent = has_news_intent(query)
         ranked: List[Tuple[int, str, Dict[str, Any]]] = []
+
         for raw in payload.get("items", []) or []:
             if not isinstance(raw, dict):
                 continue
             blob_tokens = set(tokens(self._item_blob(raw), remove_generic=False))
             topic_tokens = set(tokens(str(raw.get("topic", "")), remove_generic=False))
+
             overlap = len(q_tokens & blob_tokens)
             topic_overlap = len(q_tokens & topic_tokens)
             score = overlap + (topic_overlap * 2)
+
             if not q_tokens and news_intent:
                 score = 1
             elif score < CACHE_MIN_SCORE:
                 continue
+
             discovered = str(raw.get("discovered_at", ""))
             ranked.append((score, discovered, raw))
+
         ranked.sort(key=lambda x: (x[0], x[1]), reverse=True)
         limit = max(1, min(10, max_results))
         return [(score, item) for score, _discovered, item in ranked[:limit]]
@@ -357,18 +371,21 @@ class ResearchCache:
             if payload:
                 LOGGER.info("[CACHE] SEARCH MISS | stale cache | query=%r", query[:120])
             return None
+
         assert payload is not None
         ranked = self.search_items(payload, query, max_results)
         if not ranked:
             self.state.misses += 1
             LOGGER.info("[CACHE] SEARCH MISS | no relevant item | query=%r", query[:120])
             return None
+
         parts = [
             "ATLAS CACHE HIT — public GitHub Pages research cache",
             f"Cache generated_at: {payload.get('generated_at', '')}",
             f"Query: {query}",
             "",
         ]
+
         for idx, (score, item) in enumerate(ranked, 1):
             urls = item.get("urls", []) or []
             if not isinstance(urls, list):
@@ -395,11 +412,14 @@ class ResearchCache:
                     + fetched_text[:2200]
                 )
             parts.append("")
+
         text = "\n".join(parts).strip()
         self.state.hits_search += 1
         LOGGER.info(
             "[CACHE] SEARCH HIT | query=%r | results=%s | hit_count=%s",
-            query[:120], len(ranked), self.state.hits_search,
+            query[:120],
+            len(ranked),
+            self.state.hits_search,
         )
         return text[:CACHE_MAX_SEARCH_CHARS]
 
@@ -407,32 +427,42 @@ class ResearchCache:
         payload = await self.refresh()
         if not self.fresh(payload):
             self.state.misses += 1
+            LOGGER.info("[CACHE] FETCH MISS | stale/unavailable cache | fallback=LIVE")
             return None
+
         assert payload is not None
-        target = (url or "").strip()
+        target = url.strip()
         target_key = canonical_url_for_cache(target)
-        if not target_key:
-            return None
+
         for raw in payload.get("items", []) or []:
             if not isinstance(raw, dict):
                 continue
+
+            # IMPORTANT CORRECTNESS RULE:
+            # fetched_text belongs ONLY to fetched_url. The item's other search
+            # URLs may point to different articles and must never reuse this text.
             fetched_url = str(raw.get("fetched_url", "")).strip()
             if not fetched_url:
                 continue
             if canonical_url_for_cache(fetched_url) != target_key:
                 continue
+
             text = str(raw.get("fetched_text", "")).strip()
             if not text:
                 continue
+
             start = max(0, start_index)
             length = max(1, min(CACHE_MAX_FETCH_CHARS, max_length))
-            sliced = text[start:start + length]
+            sliced = text[start : start + length]
             if not sliced:
                 return None
+
             self.state.hits_fetch += 1
             LOGGER.info(
                 "[CACHE] FETCH HIT | url=%s | chars=%s | hit_count=%s",
-                target[:240], len(sliced), self.state.hits_fetch,
+                target[:240],
+                len(sliced),
+                self.state.hits_fetch,
             )
             return (
                 "ATLAS CACHE HIT — cached fetched content\n"
@@ -440,8 +470,9 @@ class ResearchCache:
                 f"Cache generated_at: {payload.get('generated_at', '')}\n\n"
                 f"{sliced}"
             )
+
         self.state.misses += 1
-        LOGGER.info("[CACHE] FETCH MISS | url=%s", target[:240])
+        LOGGER.info("[CACHE] FETCH MISS | url=%s | fallback=LIVE", target[:240])
         return None
 
 
@@ -449,13 +480,18 @@ CACHE = ResearchCache()
 STDOUT_LOCK: Optional[asyncio.Lock] = None
 
 
-def mcp_text_response(request_id: Any, text: str, *, is_error: bool = False) -> str:
+def mcp_text_response(request_id: Any, text: str) -> str:
     payload = {
         "jsonrpc": "2.0",
         "id": request_id,
         "result": {
-            "content": [{"type": "text", "text": text}],
-            "isError": bool(is_error),
+            "content": [
+                {
+                    "type": "text",
+                    "text": text,
+                }
+            ],
+            "isError": False,
         },
     }
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
@@ -470,214 +506,21 @@ async def write_stdout(line: str) -> None:
         sys.stdout.flush()
 
 
-async def tavily_search(query: str, max_results: int) -> Optional[str]:
-    api_key = os.environ.get("TAVILY_API_KEY", "").strip()
-    if not api_key:
-        return None
-    limit = max(1, min(TAVILY_MAX_RESULTS, max_results))
-    body: Dict[str, Any] = {
-        "query": query,
-        "search_depth": "basic",
-        "topic": "news" if has_news_intent(query) else "general",
-        "max_results": limit,
-        "include_answer": False,
-        "include_raw_content": False,
-        "include_images": False,
-    }
-    timeout = ClientTimeout(total=WEB_TIMEOUT_SECONDS)
-    try:
-        async with ClientSession(timeout=timeout) as session:
-            async with session.post(
-                TAVILY_SEARCH_URL,
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                    "User-Agent": f"ATLAS-Multi-Proxy/{VERSION}",
-                },
-                json=body,
-            ) as response:
-                raw_text = await response.text()
-                if response.status != 200:
-                    raise RuntimeError(f"HTTP {response.status}: {raw_text[:300]}")
-                data = json.loads(raw_text)
-        results = data.get("results", []) if isinstance(data, dict) else []
-        if not isinstance(results, list) or not results:
-            LOGGER.warning("[TAVILY] SEARCH EMPTY | query=%r", query[:120])
-            return None
-        parts = ["ATLAS LIVE SEARCH — Tavily", f"Query: {query}", ""]
-        count = 0
-        for item in results[:limit]:
-            if not isinstance(item, dict):
-                continue
-            url = str(item.get("url", "")).strip()
-            title = str(item.get("title", "")).strip()
-            content = str(item.get("content", "")).strip()
-            published = str(item.get("published_date", "")).strip()
-            score = item.get("score")
-            if not url and not content:
-                continue
-            count += 1
-            parts.append(f"[{count}] {title or 'Result'}")
-            if url:
-                parts.append(f"URL: {url}")
-            if published:
-                parts.append(f"Published: {published}")
-            if score is not None:
-                parts.append(f"Score: {score}")
-            if content:
-                parts.append("Snippet: " + content[:1800])
-            parts.append("")
-        if count == 0:
-            return None
-        text = "\n".join(parts).strip()
-        LOGGER.info("[TAVILY] SEARCH PASS | query=%r | results=%s", query[:120], count)
-        return text[:CACHE_MAX_SEARCH_CHARS]
-    except Exception as exc:
-        LOGGER.warning("[TAVILY] SEARCH FAIL | query=%r | %s", query[:120], exc)
-        return None
-
-
-async def serpapi_search(query: str, max_results: int) -> Optional[str]:
-    api_key = os.environ.get("SERPAPI_API_KEY", "").strip()
-    if not api_key:
-        return None
-    limit = max(1, min(SERPAPI_MAX_RESULTS, max_results))
-    params: Dict[str, str] = {
-        "engine": "google",
-        "q": query,
-        "api_key": api_key,
-        "num": str(limit),
-        "hl": "vi",
-        "gl": "vn",
-        "safe": "active",
-        "output": "json",
-    }
-    if has_news_intent(query):
-        params["tbm"] = "nws"
-    timeout = ClientTimeout(total=WEB_TIMEOUT_SECONDS)
-    try:
-        async with ClientSession(timeout=timeout) as session:
-            async with session.get(
-                SERPAPI_SEARCH_URL,
-                params=params,
-                headers={"User-Agent": f"ATLAS-Multi-Proxy/{VERSION}"},
-            ) as response:
-                raw_text = await response.text()
-                if response.status != 200:
-                    raise RuntimeError(f"HTTP {response.status}: {raw_text[:300]}")
-                data = json.loads(raw_text)
-        if not isinstance(data, dict):
-            return None
-        if data.get("error"):
-            raise RuntimeError(str(data.get("error")))
-        results = data.get("news_results") if has_news_intent(query) else data.get("organic_results")
-        if not isinstance(results, list) or not results:
-            # Google sometimes gives only an answer box/knowledge graph.
-            results = data.get("organic_results", [])
-        parts = ["ATLAS LIVE SEARCH — SerpApi / Google", f"Query: {query}", ""]
-        count = 0
-        if isinstance(results, list):
-            for item in results[:limit]:
-                if not isinstance(item, dict):
-                    continue
-                title = str(item.get("title", "")).strip()
-                url = str(item.get("link", "")).strip()
-                snippet = str(item.get("snippet", "")).strip()
-                source = item.get("source")
-                date = str(item.get("date", "")).strip()
-                if isinstance(source, dict):
-                    source = source.get("name") or source.get("title") or ""
-                source = str(source or "").strip()
-                if not url and not snippet:
-                    continue
-                count += 1
-                parts.append(f"[{count}] {title or 'Result'}")
-                if source:
-                    parts.append(f"Source: {source}")
-                if date:
-                    parts.append(f"Date: {date}")
-                if url:
-                    parts.append(f"URL: {url}")
-                if snippet:
-                    parts.append("Snippet: " + snippet[:1800])
-                parts.append("")
-        if count == 0:
-            answer_box = data.get("answer_box")
-            if isinstance(answer_box, dict):
-                text_bits = []
-                for key in ("answer", "result", "snippet", "title"):
-                    value = answer_box.get(key)
-                    if value:
-                        text_bits.append(str(value))
-                link = answer_box.get("link")
-                if text_bits:
-                    count = 1
-                    parts.append("[1] Google answer")
-                    if link:
-                        parts.append(f"URL: {link}")
-                    parts.append("Snippet: " + " — ".join(text_bits)[:2500])
-        if count == 0:
-            LOGGER.warning("[SERPAPI] SEARCH EMPTY | query=%r", query[:120])
-            return None
-        text = "\n".join(parts).strip()
-        LOGGER.info("[SERPAPI] SEARCH PASS | query=%r | results=%s", query[:120], count)
-        return text[:CACHE_MAX_SEARCH_CHARS]
-    except Exception as exc:
-        LOGGER.warning("[SERPAPI] SEARCH FAIL | query=%r | %s", query[:120], exc)
-        return None
-
-
-async def tavily_extract(url: str, start_index: int, max_length: int) -> Optional[str]:
-    api_key = os.environ.get("TAVILY_API_KEY", "").strip()
-    if not api_key or not is_public_http_url(url):
-        return None
-    body = {"urls": [url], "extract_depth": "basic"}
-    timeout = ClientTimeout(total=WEB_TIMEOUT_SECONDS)
-    try:
-        async with ClientSession(timeout=timeout) as session:
-            async with session.post(
-                TAVILY_EXTRACT_URL,
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                    "User-Agent": f"ATLAS-Multi-Proxy/{VERSION}",
-                },
-                json=body,
-            ) as response:
-                raw_text = await response.text()
-                if response.status != 200:
-                    raise RuntimeError(f"HTTP {response.status}: {raw_text[:300]}")
-                data = json.loads(raw_text)
-        results = data.get("results", []) if isinstance(data, dict) else []
-        if not isinstance(results, list) or not results:
-            LOGGER.warning("[TAVILY] EXTRACT EMPTY | url=%s", url[:240])
-            return None
-        first = results[0] if isinstance(results[0], dict) else {}
-        content = str(first.get("raw_content", "")).strip()
-        if not content:
-            return None
-        start = max(0, start_index)
-        length = max(1, min(CACHE_MAX_FETCH_CHARS, max_length))
-        sliced = content[start:start + length]
-        if not sliced:
-            return None
-        LOGGER.info("[TAVILY] EXTRACT PASS | url=%s | chars=%s", url[:240], len(sliced))
-        return f"ATLAS LIVE FETCH — Tavily Extract\nURL: {url}\n\n{sliced}"
-    except Exception as exc:
-        LOGGER.warning("[TAVILY] EXTRACT FAIL | url=%s | %s", url[:240], exc)
-        return None
-
-
 async def maybe_intercept_tool_call(message: str) -> Optional[str]:
+    if not CACHE.configured():
+        return None
+
     try:
         payload = json.loads(message)
     except Exception:
         return None
     if not isinstance(payload, dict) or payload.get("method") != "tools/call":
         return None
+
     request_id = payload.get("id")
     if request_id is None:
         return None
+
     params = payload.get("params")
     if not isinstance(params, dict):
         return None
@@ -690,35 +533,15 @@ async def maybe_intercept_tool_call(message: str) -> Optional[str]:
         query = str(arguments.get("query", "")).strip()
         if not query:
             return None
-        if query_is_restricted(query):
-            LOGGER.warning("[SAFE] SEARCH BLOCKED | query=%r", query[:120])
-            return mcp_text_response(
-                request_id,
-                "Web search blocked for this request. I can still help with safe, factual, age-appropriate information.",
-                is_error=False,
-            )
         try:
             max_results = int(arguments.get("max_results", 10))
         except (TypeError, ValueError):
             max_results = 10
-
-        if CACHE.configured():
-            hit = await CACHE.search_hit(query, max_results)
-            if hit:
-                LOGGER.info("[WEB ROUTE] tool=search | source=CACHE")
-                return mcp_text_response(request_id, hit)
-
-        live = await tavily_search(query, max_results)
-        if live:
-            LOGGER.info("[WEB ROUTE] tool=search | source=TAVILY")
-            return mcp_text_response(request_id, live)
-
-        live = await serpapi_search(query, max_results)
-        if live:
-            LOGGER.info("[WEB ROUTE] tool=search | source=SERPAPI")
-            return mcp_text_response(request_id, live)
-
-        LOGGER.info("[WEB ROUTE] tool=search | source=DUCKDUCKGO")
+        hit = await CACHE.search_hit(query, max_results)
+        if hit:
+            LOGGER.info("[CACHE] ROUTE | tool=search | source=CACHE")
+            return mcp_text_response(request_id, hit)
+        LOGGER.info("[CACHE] ROUTE | tool=search | source=LIVE")
         return None
 
     if name == "fetch_content":
@@ -733,19 +556,11 @@ async def maybe_intercept_tool_call(message: str) -> Optional[str]:
             max_length = int(arguments.get("max_length", 8000))
         except (TypeError, ValueError):
             max_length = 8000
-
-        if CACHE.configured():
-            hit = await CACHE.fetch_hit(url, start_index, max_length)
-            if hit:
-                LOGGER.info("[WEB ROUTE] tool=fetch_content | source=CACHE")
-                return mcp_text_response(request_id, hit)
-
-        live = await tavily_extract(url, start_index, max_length)
-        if live:
-            LOGGER.info("[WEB ROUTE] tool=fetch_content | source=TAVILY")
-            return mcp_text_response(request_id, live)
-
-        LOGGER.info("[WEB ROUTE] tool=fetch_content | source=DUCKDUCKGO")
+        hit = await CACHE.fetch_hit(url, start_index, max_length)
+        if hit:
+            LOGGER.info("[CACHE] ROUTE | tool=fetch_content | source=CACHE")
+            return mcp_text_response(request_id, hit)
+        LOGGER.info("[CACHE] ROUTE | tool=fetch_content | source=LIVE")
         return None
 
     return None
@@ -757,10 +572,11 @@ async def warm_cache_loop() -> None:
         return
     if not CACHE.configured():
         LOGGER.warning(
-            "[CACHE] DISABLED | set ATLAS_RESEARCH_CACHE_URL (or RESEARCH_CACHE_URL) "
+            "[CACHE] DISABLED | set ATLAS_RESEARCH_CACHE_URL (or legacy RESEARCH_CACHE_URL) "
             "or ATLAS_GITHUB_REPOSITORY"
         )
         return
+
     LOGGER.info("[CACHE] ENABLED | source=%s", CACHE.state.source_url)
     while True:
         try:
@@ -775,6 +591,7 @@ async def warm_cache_loop() -> None:
 async def parent_to_child(process: asyncio.subprocess.Process) -> None:
     if process.stdin is None:
         raise RuntimeError("upstream MCP stdin unavailable")
+
     while True:
         line = await asyncio.to_thread(sys.stdin.readline)
         if line == "":
@@ -783,13 +600,16 @@ async def parent_to_child(process: asyncio.subprocess.Process) -> None:
             except Exception:
                 pass
             return
+
         message = line.rstrip("\r\n")
         if not message:
             continue
+
         intercepted = await maybe_intercept_tool_call(message)
         if intercepted is not None:
             await write_stdout(intercepted)
             continue
+
         process.stdin.write((message + "\n").encode("utf-8"))
         await process.stdin.drain()
 
@@ -797,6 +617,7 @@ async def parent_to_child(process: asyncio.subprocess.Process) -> None:
 async def child_to_parent(process: asyncio.subprocess.Process) -> None:
     if process.stdout is None:
         raise RuntimeError("upstream MCP stdout unavailable")
+
     while True:
         raw = await process.stdout.readline()
         if not raw:
@@ -812,18 +633,13 @@ async def child_stderr(process: asyncio.subprocess.Process) -> None:
         if not raw:
             return
         text = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+        # Keep upstream diagnostics visible in Render logs via mcp_pipe stderr reader.
         print(f"[UPSTREAM_DDG] {text}", file=sys.stderr, flush=True)
 
 
 async def main() -> int:
     command = upstream_command()
-    LOGGER.info("ATLAS Multi-Source Proxy v%s starting", VERSION)
-    LOGGER.info(
-        "Sources | cache=%s | tavily=%s | serpapi=%s | ddg=enabled",
-        "enabled" if CACHE.configured() else "disabled",
-        "enabled" if os.environ.get("TAVILY_API_KEY", "").strip() else "disabled",
-        "enabled" if os.environ.get("SERPAPI_API_KEY", "").strip() else "disabled",
-    )
+    LOGGER.info("ATLAS Cache Proxy v%s starting", VERSION)
     LOGGER.info("Upstream MCP: %s", " ".join(command))
 
     child_env = os.environ.copy()
@@ -834,13 +650,18 @@ async def main() -> int:
         stderr=asyncio.subprocess.PIPE,
         env=child_env,
     )
+
     cache_task = asyncio.create_task(warm_cache_loop(), name="atlas-cache-warm")
     p2c = asyncio.create_task(parent_to_child(process), name="parent-to-ddg")
     c2p = asyncio.create_task(child_to_parent(process), name="ddg-to-parent")
     cerr = asyncio.create_task(child_stderr(process), name="ddg-stderr")
     wait = asyncio.create_task(process.wait(), name="ddg-exit")
 
-    done, pending = await asyncio.wait({p2c, c2p, wait}, return_when=asyncio.FIRST_COMPLETED)
+    done, pending = await asyncio.wait(
+        {p2c, c2p, wait},
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+
     exit_code = process.returncode
     if wait in done:
         exit_code = wait.result()
@@ -854,6 +675,7 @@ async def main() -> int:
         cerr.cancel()
 
     await asyncio.gather(*pending, cache_task, cerr, return_exceptions=True)
+
     if process.returncode is None:
         process.terminate()
         try:
@@ -861,6 +683,7 @@ async def main() -> int:
         except asyncio.TimeoutError:
             process.kill()
             await process.wait()
+
     return int(exit_code or 0)
 
 
@@ -870,5 +693,5 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         raise SystemExit(130)
     except Exception as exc:
-        LOGGER.exception("ATLAS Multi-Source Proxy FAIL: %s", exc)
+        LOGGER.exception("ATLAS Cache Proxy FAIL: %s", exc)
         raise SystemExit(1)
