@@ -1,0 +1,36 @@
+name: ATLAS Shared Static Audit
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main"]
+    paths:
+      - "mcp-calculator-main/**"
+      - "tests/**"
+      - ".github/workflows/atlas_research.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: "mcp-calculator-main/requirements.txt"
+      - name: Install runtime dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r mcp-calculator-main/requirements.txt
+      - name: Static compile
+        run: |
+          python -m py_compile mcp-calculator-main/atlas_search_router.py
+          python -m py_compile mcp-calculator-main/atlas_cache_mcp_proxy.py
+          python -m py_compile mcp-calculator-main/mcp_pipe.py
+      - name: Offline regression suite
+        run: python -m unittest discover -s tests -p "test_*.py" -v
